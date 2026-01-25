@@ -1,0 +1,233 @@
+English
+
+
+Added %s random tracks
+Ran out of songs!
+Cleared the queue!
+Error moving item inside queue: invalid-argument
+Successfully moved item inside queue:
+Error moving item inside queue:
+Moved down in queue:
+Error moving down in queue:
+Moved up in queue:
+Error moving up in queue:
+Deleted from queue:
+Error deleting from queue:
+
+Upon completion, it will be added to queue.
+Upon completion, it will appear in the "available songs" list.
+Error: Can't delete this song because it is in the current queue:
+Song deleted:
+Error: No song parameter specified!
+Error: Can't edit this song because it is currently being played:
+Song File Edit
+Error Renaming file: '%s' to '%s'. Filename already exists.
+Renamed file: '%s' to '%s'
+Error: No filename parameters were specified!
+Unknown
+Running
+Stopped
+ (CPU only)
+ (GPU enabled)
+
+
+
+
+
+
+
+
+
+
+
+
+
+VLC path not found! 
+
+Creating media path: 
+Wifi/Network not connected. Shutting down in 10s...
+For selecting songs, scan QR or connect to 
+For TV display, connect to 
+Press F to toggle full-screen
+Press ESC to quit Open Home KTV
+RaspiWifiConfig setup mode detected!
+Connect another device/smartphone to the Wifi AP: '%s'
+Then point its browser to: '%s://%s%s' and follow the instructions.
+Up next: 
+Added by: 
+Now playing: 
+
+Increasing audio delay will give you more time to read lyrics before singing out the next sentence.
+Decreasing subtitle delay will give you more time to read lyrics before singing out the next sentence.
+A semitone is also known as a half-step. It is the smallest interval used in classical Western music, equal to a twelfth of an octave or half a tone.
+
+Player Control
+
+
+
+Change Key
+Nothing is playing right now.
+No song is queued.
+This song is not added by you. Are you sure you want to restart this track?
+This song is not added by you. Are you sure you want to skip this track?
+Player Control
+Now Playing
+Next Song
+Seek To:
+Audio Delay (sec)
+Subtitle Delay (sec)
+Restart Song
+Play/Pause
+Skip Current Song
+Volume Down
+Set Volume
+Volume Up
+Decrease Subtitle Delay
+Set Subtitle Delay
+Increase Subtitle Delay
+Decrease Audio Delay
+Set Audio Delay
+Increase Audio Delay
+ semitones
+Please enter your name. This will show up next to the songs you queue up from this device.
+Song added to the queue: 
+Song already in the queue: 
+Sort by Date
+Sort by Alphabetical
+Add '%s' to the queue
+Browse
+Sorted by 'Date'
+Sorted by 'Alphabetical'
+songs
+displaying <b>{start} - {end}</b> {record_name}, in total <b>{total}</b> {record_name}
+found <b>{found}</b> {record_name}, displaying <b>{start} - {end}</b> {record_name}
+Edit song
+Move up in queue
+Move down in queue
+Are you sure you want to delete from the queue
+Are you sure you want to clear the ENTIRE queue?
+Add 3 random songs
+Clear all
+The queue is empty
+Queue
+Delete
+Available songs in local library
+Added song to queue:
+Song is already in the queue:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Available Songs
+Do you want to change the display name of the person using this device? This will show up next to the queued songs. Current:
+Current user
+Settings
+Open Home KTV
+
+
+
+
+
+Information
+Handy URL QR code to share with a pal:
+OS
+Disk Usage
+Memory
+
+
+
+Open Home KTV version
+Advanced Control Options
+
+
+
+
+
+
+
+
+
+
+
+Refresh the song list:
+Rescan song directory
+You should only need to do this if you manually copied files to the media directory while Open Home KTV was running.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+System Info
+Home
+Change Language
+Please choose language
+System Language
+Current system language:
+This changes the language of the Open Home KTV backend system which gets displayed onto TV screen; moreover, each connecting user can also change their respective Web UI language in the globe button in the right-top menu. 
+
+
+Song added to the queue!
+Failed to queue the song!
+System Info & Settings
+Volume Normalization
+Different songs often have different volume. Enabling volume normalization will first run <i>ffmpeg</i> to compute the global volume of a song and automatically adjust player volume so that every song sounds equally loud.
+Song library path
+Total number of songs
+Show/Hide Subtitle
+Change Speed
+You can sing the song faster or slower by changing the playback speed to within 0.8x to 1.2x using the speed trackbar; for other playback speed, click on the speed value to change.
+Click to reset playback speed to 1x
+Click to set playback speed
+Click to reset key/pitch
+Reset Key
+Reset Speed
+
+
+
+
+Save Play Settings
+Save play settings for each song, this includes: audio delay, subtitle delay, and whether to show subtitles.
+
+
+
+
+Edit Song Name:
+Save
+Delete this song
+Are you sure you want to delete this song from the library?
+Request parameter error!
+Trim the song:
+Adjust song volume:
+Begin time:
+End time:
+Original Volume (dBFS):
+Cannot find any song matching "%s".
+Added "%s" into queue.
+Please choose the song(s) to add:
+UNDO
+Close
+Add
+Video duration: 
+

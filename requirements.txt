@@ -1,0 +1,12 @@
+Flask==2.3.1
+flask-paginate==2021.10.29
+flask-sock
+numpy==1.26.4
+pillow
+psutil
+pygame==2.5.2
+python-bidi
+arabic-reshaper
+qrcode
+requests
+unidecode

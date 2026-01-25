@@ -1,0 +1,11 @@
+*.pyc
+*.swp
+.vscode/
+__pycache__/
+.venv/
+venv/
+env/
+songs/
+qrcode.png
+.DS_Store
+media_paths.local.conf

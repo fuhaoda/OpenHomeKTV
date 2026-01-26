@@ -47,6 +47,22 @@
   {% endif %}
 </p>
 
+<form id="browse-search-form" class="browse-search" method="get" action="/f_browse">
+  <div class="field">
+    <div class="control">
+      <input
+        id="browse-search-input"
+        class="input is-small"
+        type="search"
+        name="q"
+        value="{{ query }}"
+        placeholder="{{ getString1(235) }}"
+        autocomplete="off"
+      />
+    </div>
+  </div>
+</form>
+
 <div id="alpha-bar" class="has-background-dark mobile-hide" >
   <a onclick="switch_pane('/f_browse?letter=numeric')">#</a>
   {% for letter in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']  %}
@@ -81,6 +97,16 @@ $('.pagination').on('click', 'a', function(e) {
   }
   e.preventDefault();
   switch_pane(href);
+});
+
+$('#browse-search-form').on('submit', function(e) {
+  e.preventDefault();
+  var query = $.trim($('#browse-search-input').val());
+  var url = '/f_browse';
+  if (query) {
+    url += '?q=' + encodeURIComponent(query);
+  }
+  switch_pane(url);
 });
 
 if ($(window).width() <= 500) {

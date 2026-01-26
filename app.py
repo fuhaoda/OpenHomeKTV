@@ -116,6 +116,16 @@ def filename_from_path(file_path, strip_suffix = True):
 	return rc
 
 
+def filename_for_search(file_path):
+	name = filename_from_path(file_path)
+	if isinstance(name, bytes):
+		try:
+			name = name.decode("utf-8", "ignore")
+		except Exception:
+			name = str(name)
+	return name
+
+
 def url_escape(filename):
 	return quote(filename.encode("utf8"))
 
@@ -407,13 +417,17 @@ def vol_set(volume):
 
 @app.route("/browse", methods = ["GET"])
 def browse():
-	search = bool(request.args.get('q'))
+	raw_query = request.args.get('q', '')
+	query = raw_query.strip()
+	search = bool(query)
 	page = request.args.get(get_page_parameter(), type = int, default = 1)
 
 	letter = request.args.get('letter')
+	if search:
+		letter = None
 
 	available_songs = K.available_songs
-	if letter:
+	if letter and not search:
 		if (letter == "numeric"):
 			available_songs = [k for k,v in K.songname_trans.items() if not v[0].islower()]
 		else:
@@ -430,13 +444,18 @@ def browse():
 		sort_order_text = getString2(100)
 
 	results_per_page = 200
-	pagination = Pagination(css_framework = 'bulma', page = page, total = len(songs), search = search, search_msg = getString2(103),
+	if search:
+		query_fold = query.casefold()
+		songs = [song for song in songs if query_fold in filename_for_search(song).casefold()]
+	found = len(songs)
+	pagination = Pagination(css_framework = 'bulma', page = page, total = found, found = found, search = search, search_msg = getString2(103),
 	                        record_name = getString2(101), display_msg = getString2(102), per_page = results_per_page)
 	start_index = (page - 1) * results_per_page
 	return render_template(
 		"files.html",
 		getString1 = getString2,
 		pagination = pagination,
+		query = query,
 		results_per_page = results_per_page,
 		sort_order = sort_order,
 		sort_order_text = sort_order_text,
@@ -447,13 +466,17 @@ def browse():
 @app.route("/f_browse", methods = ["GET"])
 def f_browse():
 	ip2pane[request.remote_addr] = 'browse'
-	search = bool(request.args.get('q'))
+	raw_query = request.args.get('q', '')
+	query = raw_query.strip()
+	search = bool(query)
 	page = request.args.get(get_page_parameter(), type = int, default = 1)
 
 	letter = request.args.get('letter')
+	if search:
+		letter = None
 
 	available_songs = K.available_songs
-	if letter:
+	if letter and not search:
 		if (letter == "numeric"):
 			available_songs = [k for k,v in K.songname_trans.items() if not v[0].islower()]
 		else:
@@ -470,13 +493,18 @@ def f_browse():
 		sort_order_text = getString2(100)
 
 	results_per_page = 200
-	pagination = Pagination(css_framework = 'bulma', page = page, total = len(songs), search = search, search_msg = getString2(103),
+	if search:
+		query_fold = query.casefold()
+		songs = [song for song in songs if query_fold in filename_for_search(song).casefold()]
+	found = len(songs)
+	pagination = Pagination(css_framework = 'bulma', page = page, total = found, found = found, search = search, search_msg = getString2(103),
 	                        record_name = getString2(101), display_msg = getString2(102), per_page = results_per_page)
 	start_index = (page - 1) * results_per_page
 	return render_template(
 		"f_browse.html",
 		getString1 = getString2,
 		pagination = pagination,
+		query = query,
 		results_per_page = results_per_page,
 		sort_order = sort_order,
 		sort_order_text = sort_order_text,

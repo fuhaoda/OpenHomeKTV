@@ -95,6 +95,25 @@
   {% endif %}
 </p>
 
+<form class="browse-search" method="get" action="{{ url_for('browse') }}">
+  {% if sort_order == "Date" %}
+  <input type="hidden" name="sort" value="date" />
+  {% endif %}
+  <div class="field">
+    <div class="control">
+      <input
+        id="browse-search-input"
+        class="input is-small"
+        type="search"
+        name="q"
+        value="{{ query }}"
+        placeholder="{{ getString1(235) }}"
+        autocomplete="off"
+      />
+    </div>
+  </div>
+</form>
+
 <div id="alpha-bar" class="has-background-dark mobile-hide" >
   <a href="{{ url_for('browse') }}?letter=numeric">#</a>
   {% for letter in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']  %}

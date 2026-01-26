@@ -56,6 +56,9 @@
 
 {{ pagination.links }}
 {{ pagination.info }}
+<p class="pagination-page-info">
+  {{ getString1(234).format(per_page=results_per_page, record_name=getString1(101)) }}
+</p>
 <table>
   {% for song in songs %}
   <tr value='{{ song }}'>
@@ -71,6 +74,15 @@
 </div>
 
 <script>
+$('.pagination').on('click', 'a', function(e) {
+  var href = $(this).attr('href');
+  if (!href || href === '#') {
+    return;
+  }
+  e.preventDefault();
+  switch_pane(href);
+});
+
 if ($(window).width() <= 500) {
   $(document).scroll(function() {
     var y = $(this).scrollTop();

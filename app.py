@@ -429,14 +429,15 @@ def browse():
 		sort_order = "Alphabetical"
 		sort_order_text = getString2(100)
 
-	results_per_page = 500
+	results_per_page = 200
 	pagination = Pagination(css_framework = 'bulma', page = page, total = len(songs), search = search, search_msg = getString2(103),
 	                        record_name = getString2(101), display_msg = getString2(102), per_page = results_per_page)
-	start_index = (page - 1) * (results_per_page - 1)
+	start_index = (page - 1) * results_per_page
 	return render_template(
 		"files.html",
 		getString1 = getString2,
 		pagination = pagination,
+		results_per_page = results_per_page,
 		sort_order = sort_order,
 		sort_order_text = sort_order_text,
 		letter = letter,
@@ -468,14 +469,15 @@ def f_browse():
 		sort_order = "Alphabetical"
 		sort_order_text = getString2(100)
 
-	results_per_page = 500
+	results_per_page = 200
 	pagination = Pagination(css_framework = 'bulma', page = page, total = len(songs), search = search, search_msg = getString2(103),
 	                        record_name = getString2(101), display_msg = getString2(102), per_page = results_per_page)
-	start_index = (page - 1) * (results_per_page - 1)
+	start_index = (page - 1) * results_per_page
 	return render_template(
 		"f_browse.html",
 		getString1 = getString2,
 		pagination = pagination,
+		results_per_page = results_per_page,
 		sort_order = sort_order,
 		sort_order_text = sort_order_text,
 		letter = letter,
@@ -619,7 +621,7 @@ def load_media_paths(base_dir):
 
 if __name__ == "__main__":
 	platform = get_platform()
-	default_port = 5000
+	default_port = 5232
 	default_volume = 0
 	default_splash_delay = 3
 	default_log_level = logging.INFO

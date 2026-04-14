@@ -456,8 +456,7 @@ class VLCClient:
 		if not track_ids:
 			stream_indices = probe_audio_streams(file_path)
 			if stream_indices:
-				base = 0 if current_id == 0 else 1
-				track_ids = list(range(base, base + len(stream_indices)))
+				track_ids = stream_indices
 				source = "ffprobe"
 				logging.debug("Fallback audio tracks via ffprobe/ffmpeg: %s (current=%s)", track_ids, current_id)
 

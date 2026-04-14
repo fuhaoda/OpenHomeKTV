@@ -117,7 +117,11 @@ function set_reset_speed(state){
 }
 
 $(".control-box").hide();
-$("#next-audio-track").click(() => { $.get("/next_audio_track"); });
+$("#next-audio-track").click(() => {
+	$.get("/next_audio_track", () => {
+		setTimeout(getNowPlaying, 250);
+	});
+});
 
 var slider = document.getElementById("transpose");
 var slider_prev_value = 0;
@@ -230,6 +234,7 @@ $("#semitones-info").click(() => {showNotification("{{getString1(62)}}","is-info
 $("#playspeed-info").click(() => {showNotification("{{getString1(200)}}","is-info",10000)});
 
 getNowPlaying();
+setInterval(getNowPlaying, 1500);
 if(isMobile)
 	$("#label-player-control")[0].outerHTML = '<h3 id="label-player-control">{{getString1(73)}}</h3>';
 

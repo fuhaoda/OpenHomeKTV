@@ -4,6 +4,7 @@ import shutil
 import gzip
 from subprocess import check_output
 from collections import *
+from functools import wraps
 
 import numpy as np
 
@@ -27,6 +28,13 @@ STD_VOL = 65536/8/np.sqrt(2)
 ip2websock, ip2pane = {}, {}
 
 ws_send = lambda ip, msg: ip2websock[ip].send(msg) if ip in ip2websock else None
+
+def synchronized_state(method):
+	@wraps(method)
+	def wrapper(self, *args, **kwargs):
+		with self.state_lock:
+			return method(self, *args, **kwargs)
+	return wrapper
 
 def flash(message: str, category: str = "message", client_ip = ''):
 	ws_send(client_ip or request.remote_addr, f'showNotification("{message}", "{category}")')
@@ -91,6 +99,7 @@ class Karaoke:
 		self.log_level = int(args.log_level)
 		self.pending_audio_track_index = None
 		self.pending_audio_track_cli_index = None
+		self.state_lock = threading.RLock()
 
 		logging.basicConfig(
 			format = "[%(asctime)s] %(levelname)s: %(message)s",
@@ -424,13 +433,17 @@ class Karaoke:
 		if self.vlcclient is not None:
 			self.vlcclient.kill()
 
+	@synchronized_state
 	def play_file(self, file_path, extra_params = []):
 		self.switchingSong = True
+		is_new_media = file_path != self.now_playing_filename
 		if self.save_delays:
 			saved_delays = self.delays.get(os.path.basename(file_path), {})
 			self.audio_delay = self.audio_delay if self.audio_delay else saved_delays.get('audio_delay', 0)
 			self.subtitle_delay = self.subtitle_delay if self.subtitle_delay else saved_delays.get('subtitle_delay', 0)
 			self.show_subtitle = False if self.show_subtitle==False else saved_delays.get('show_subtitle', True)
+		if is_new_media and self.pending_audio_track_index is None and self.pending_audio_track_cli_index is None:
+			self.prepare_default_audio_track(file_path)
 		extra_params1 = []
 		logging.info("Playing video in VLC: " + file_path)
 		if self.platform != 'osx':
@@ -443,7 +456,10 @@ class Karaoke:
 		if self.show_subtitle:
 			extra_params1 += [f'--sub-track=0']
 		if self.pending_audio_track_cli_index is not None:
-			extra_params1 += [f'--audio-track={self.pending_audio_track_cli_index}']
+			# VLC's --audio-track uses a 0-based ordinal, while the IDs returned by
+			# status/pl_info/ffprobe are stream IDs. Use --audio-track-id so reloads
+			# preserve the intended track reliably across containers/codecs.
+			extra_params1 += [f'--audio-track-id={self.pending_audio_track_cli_index}']
 		if self.play_speed != 1:
 			extra_params1 += [f'--rate={self.play_speed}']
 		self.now_playing = self.filename_from_path(file_path)
@@ -469,11 +485,15 @@ class Karaoke:
 		self.status_dirty = True
 		self.render_splash_screen()  # remove old previous track
 
+	@synchronized_state
 	def play_transposed(self, semitones):
 		self.now_playing_transpose = semitones
 		status_xml = self.vlcclient.command().text if self.is_paused else self.vlcclient.pause(False).text
 		info = self.vlcclient.get_info_xml(status_xml)
 		posi = info['position']*info['length']
+		if self.audio_track_index and self.audio_track_index >= 1:
+			self.pending_audio_track_index = self.audio_track_index
+			self.pending_audio_track_cli_index = self._infer_audio_track_cli_index(self.audio_track_index)
 		self.play_file(self.now_playing_filename, [f'--start-time={posi}'] + (['--start-paused'] if self.is_paused else []))
 
 	def is_file_playing(self):
@@ -486,6 +506,7 @@ class Karaoke:
 	def is_song_in_queue(self, song_path):
 		return song_path in map(lambda t: t['file'], self.queue)
 
+	@synchronized_state
 	def enqueue(self, song_path, user = "Pikaraoke"):
 		if (self.is_song_in_queue(song_path)):
 			logging.warn("Song is already in queue, will not add: " + song_path)
@@ -496,6 +517,7 @@ class Karaoke:
 			self.update_queue()
 			return True
 
+	@synchronized_state
 	def queue_add_random(self, amount):
 		logging.info("Adding %d random songs to queue" % amount)
 		songs = list(self.available_songs)  # make a copy
@@ -518,16 +540,19 @@ class Karaoke:
 		self.update_queue()
 		return True
 
+	@synchronized_state
 	def update_queue(self):
 		self.queue_json = json.dumps(self.queue)
 		self.status_dirty = True
 
+	@synchronized_state
 	def queue_clear(self):
 		logging.info("Clearing queue!")
 		self.queue = []
 		self.update_queue()
 		self.skip()
 
+	@synchronized_state
 	def queue_edit(self, song_file, action, **kwargs):
 		if action == "move":
 			try:
@@ -573,6 +598,7 @@ class Karaoke:
 		self.update_queue()
 		return True
 
+	@synchronized_state
 	def skip(self):
 		if self.is_file_playing():
 			logging.info("Skipping: " + self.now_playing)
@@ -582,6 +608,7 @@ class Karaoke:
 		logging.warning("Tried to skip, but no file is playing!")
 		return False
 
+	@synchronized_state
 	def seek(self, seek_sec):
 		if self.is_file_playing():
 			self.vlcclient.seek(seek_sec)
@@ -603,6 +630,7 @@ class Karaoke:
 			self.delays.pop(basename, {})
 		self.delays_dirty = True
 
+	@synchronized_state
 	def set_audio_delay(self, delay):
 		if delay == '+':
 			self.audio_delay += 0.1
@@ -627,6 +655,7 @@ class Karaoke:
 		logging.warning("Tried to set audio delay, but no file is playing!")
 		return False
 
+	@synchronized_state
 	def set_subtitle_delay(self, delay):
 		if delay == '+':
 			self.subtitle_delay += 0.1
@@ -651,12 +680,14 @@ class Karaoke:
 		logging.warning("Tried to set subtitle delay, but no file is playing!")
 		return False
 
+	@synchronized_state
 	def toggle_subtitle(self):
 		self.show_subtitle = not self.show_subtitle
 		if self.save_delays:
 			self.set_delays_dict(self.now_playing_filename, 'show_subtitle', self.show_subtitle, True)
 		self.reload_current_track()
 
+	@synchronized_state
 	def pause(self):
 		if self.is_file_playing():
 			logging.info("Toggling pause: " + self.now_playing)
@@ -672,6 +703,7 @@ class Karaoke:
 			logging.warning("Tried to pause, but no file is playing!")
 			return False
 
+	@synchronized_state
 	def vol_up(self):
 		if self.is_file_playing():
 			self.vlcclient.vol_up()
@@ -683,6 +715,7 @@ class Karaoke:
 			logging.warning("Tried to volume up, but no file is playing!")
 			return False
 
+	@synchronized_state
 	def vol_down(self):
 		if self.is_file_playing():
 			self.vlcclient.vol_down()
@@ -694,6 +727,7 @@ class Karaoke:
 			logging.warning("Tried to volume down, but no file is playing!")
 			return False
 
+	@synchronized_state
 	def vol_set(self, volume):
 		if self.is_file_playing():
 			self.vlcclient.vol_set(volume)
@@ -705,6 +739,7 @@ class Karaoke:
 			logging.warning("Tried to set volume, but no file is playing!")
 			return False
 
+	@synchronized_state
 	def play_speed_set(self, speed):
 		if self.is_file_playing():
 			self.vlcclient.playspeed_set(speed)
@@ -720,88 +755,101 @@ class Karaoke:
 		if not self.is_file_playing():
 			return desired_index
 		current_id, track_ids, _ = self.vlcclient.get_audio_track_info(file_path=self.now_playing_filename)
-		if current_id == 0 or (track_ids and track_ids[0] == 0):
-			return max(desired_index - 1, 0)
+		return self._get_audio_track_id(track_ids, desired_index)
+
+	def _get_audio_track_id(self, track_ids, desired_index):
+		if track_ids and 1 <= desired_index <= len(track_ids):
+			return track_ids[desired_index - 1]
 		return desired_index
 
+	def _get_default_audio_track_index(self, track_ids):
+		if len(track_ids) >= 2:
+			return 2
+		return 1
+
+	@synchronized_state
+	def prepare_default_audio_track(self, file_path):
+		_, track_ids, _ = self.vlcclient.get_audio_track_info(file_path=file_path)
+		if not track_ids:
+			return
+		desired_index = self._get_default_audio_track_index(track_ids)
+		self.audio_track_total = len(track_ids)
+		self.audio_track_index = desired_index
+		if desired_index > 1:
+			self.pending_audio_track_index = desired_index
+			self.pending_audio_track_cli_index = self._get_audio_track_id(track_ids, desired_index)
+
+	@synchronized_state
 	def update_audio_track_status(self, xml=None):
 		prev_index = self.audio_track_index
-		self.audio_track_index = 1
-		self.audio_track_total = 1
 		if not self.is_file_playing():
+			self.audio_track_index = 1
+			self.audio_track_total = 1
+			self.audio_track_source = "unknown"
 			return
 		current_id, track_ids, source = self.vlcclient.get_audio_track_info(xml, self.now_playing_filename)
-		self.audio_track_source = source or "unknown"
+		new_index = 1
+		new_total = 1
 		if track_ids:
-			self.audio_track_total = len(track_ids)
+			new_total = len(track_ids)
 			try:
-				self.audio_track_index = track_ids.index(current_id) + 1
+				new_index = track_ids.index(current_id) + 1
 			except ValueError:
-				if 1 <= prev_index <= self.audio_track_total:
-					self.audio_track_index = prev_index
+				if 1 <= prev_index <= new_total:
+					new_index = prev_index
 				else:
-					self.audio_track_index = 1
+					new_index = self._get_default_audio_track_index(track_ids)
+		self.audio_track_index = new_index
+		self.audio_track_total = new_total
+		self.audio_track_source = source or "unknown"
 
+	@synchronized_state
 	def set_default_audio_track(self, xml=None):
-		current_id, track_ids, source = self.vlcclient.get_audio_track_info(xml, self.now_playing_filename)
-		desired_index = self.pending_audio_track_index or 1
-		if track_ids and source in ("xml", "pl_info", "probe", "cache"):
-			desired_index = min(max(desired_index, 1), len(track_ids))
-			self.vlcclient.set_audio_track(track_ids[desired_index - 1])
-		self.update_audio_track_status()
+		_, track_ids, source = self.vlcclient.get_audio_track_info(xml, self.now_playing_filename)
+		self.audio_track_source = source or "unknown"
+		desired_index = self.pending_audio_track_index
+		if desired_index is None:
+			desired_index = self._get_default_audio_track_index(track_ids)
+		if not track_ids:
+			self.update_audio_track_status(xml)
+			return
 
+		desired_index = min(max(desired_index, 1), len(track_ids))
+		# On macOS/VLC the HTTP status often omits the active audio track entirely.
+		# Keep the app's selected track as the source of truth and let reloads choose
+		# the stream via --audio-track-id, rather than mixing in HTTP audio_track calls.
+		self.audio_track_total = len(track_ids)
+		self.audio_track_index = desired_index
+		self.status_dirty = True
+
+	@synchronized_state
 	def next_audio_track(self):
 		if not self.is_file_playing():
 			return False
-		current_id, track_ids, source = self.vlcclient.get_audio_track_info(file_path=self.now_playing_filename)
+		_, track_ids, source = self.vlcclient.get_audio_track_info(file_path=self.now_playing_filename)
 		if not track_ids or len(track_ids) == 1:
 			self.update_audio_track_status()
 			return False
-		if source in ("stream_count", "ffprobe", "unknown"):
-			probed = self.vlcclient.probe_audio_track_ids(len(track_ids), current_id)
-			if probed:
-				track_ids = probed
-				self.vlcclient.audio_track_cache[self.now_playing_filename] = probed
-				source = "probe"
-		try:
-			current_index = track_ids.index(current_id) + 1
-		except ValueError:
-			current_index = self.audio_track_index if 1 <= self.audio_track_index <= len(track_ids) else 1
+		current_index = self.audio_track_index if 1 <= self.audio_track_index <= len(track_ids) else self._get_default_audio_track_index(track_ids)
 		next_index = (current_index % len(track_ids)) + 1
-
-		switched = False
-		if source in ("xml", "pl_info", "probe", "cache"):
-			desired_id = track_ids[next_index - 1]
-			resp = self.vlcclient.set_audio_track(desired_id)
-			new_current, _, _ = self.vlcclient.get_audio_track_info(
-				resp.text if hasattr(resp, "text") else None,
-				self.now_playing_filename
-			)
-			switched = new_current == desired_id
-
-		if not switched:
-			self.pending_audio_track_index = next_index
-			self.pending_audio_track_cli_index = self._infer_audio_track_cli_index(next_index)
-			self.reload_current_track(audio_track_index=next_index)
-
+		self.audio_track_source = source or "unknown"
+		self.pending_audio_track_index = next_index
+		self.pending_audio_track_cli_index = self._get_audio_track_id(track_ids, next_index)
+		self.reload_current_track(audio_track_index=next_index)
 		self.audio_track_index = next_index
 		self.audio_track_total = len(track_ids)
 		self.status_dirty = True
 		return True
 
+	@synchronized_state
 	def enforce_audio_track(self):
 		if not self.is_file_playing():
 			return
 		if self.audio_track_total <= 1:
 			return
-		current_id, track_ids, source = self.vlcclient.get_audio_track_info(file_path=self.now_playing_filename)
-		if source in ("xml", "pl_info", "probe", "cache") and track_ids:
-			desired_index = min(max(self.audio_track_index, 1), len(track_ids))
-			desired_id = track_ids[desired_index - 1]
-			if current_id != desired_id:
-				self.vlcclient.set_audio_track(desired_id)
 		self.update_audio_track_status()
 
+	@synchronized_state
 	def reload_current_track(self, audio_track_index=None):
 		if not self.is_file_playing():
 			logging.warning("Tried to reload, but no file is playing!")
@@ -811,13 +859,14 @@ class Karaoke:
 		posi = info['position']*info['length']
 		if audio_track_index is None:
 			audio_track_index = self.audio_track_index
-		if audio_track_index and audio_track_index > 1:
+		if audio_track_index and audio_track_index >= 1:
 			self.pending_audio_track_index = audio_track_index
 			self.pending_audio_track_cli_index = self._infer_audio_track_cli_index(audio_track_index)
 		self.play_file(self.now_playing_filename, [f'--start-time={posi}'] + (['--start-paused'] if self.is_paused else []))
 		self.update_audio_track_status()
 		return True
 
+	@synchronized_state
 	def get_state(self):
 		if self.vlcclient.is_transposing:
 			return defaultdict(lambda: None, self.player_state)
@@ -829,6 +878,7 @@ class Karaoke:
 		self.update_audio_track_status()
 		return defaultdict(lambda: None, self.player_state)
 
+	@synchronized_state
 	def restart(self):
 		if self.is_file_playing():
 			self.vlcclient.restart()
@@ -866,6 +916,7 @@ class Karaoke:
 			self.initialize_screen()
 			self.render_splash_screen()
 
+	@synchronized_state
 	def reset_now_playing(self):
 		self.auto_save_delays()
 		self.now_playing = None

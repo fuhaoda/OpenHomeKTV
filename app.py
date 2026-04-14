@@ -59,20 +59,23 @@ def status_thread():
 	while True:
 		K.event_dirty.wait(1)
 
-		status = nowplaying(False)
+		status = get_nowplaying_snapshot()
 		if not status: continue
 
 		status_full = json.dumps(status)
 		status.pop('seektrack_value', None)
 		status_str = json.dumps(status)
-		if status_str != cached_status:
-			K.status_dirty = True
-			cached_status = status_str
+		with K.state_lock:
+			if status_str != cached_status:
+				K.status_dirty = True
+				cached_status = status_str
+			dirty = K.status_dirty
 
-		if not K.status_dirty:
-			if not K.is_file_playing():
-				continue
-			tm = K.get_state().get('time', None)
+		if not dirty:
+			with K.state_lock:
+				if not K.is_file_playing():
+					continue
+				tm = K.get_state().get('time', None)
 			if tm is None:
 				continue
 			for ip, ws in ip2websock.items():
@@ -85,7 +88,8 @@ def status_thread():
 				ws.send(f"update('{status_full}')")
 			elif ip2pane.get(ip, '') == 'queue':
 				ws.send(f"update('{K.queue_json}')")
-		K.status_dirty = False
+		with K.state_lock:
+			K.status_dirty = False
 
 # Define global symbols for Jinja templates 
 @app.context_processor
@@ -130,64 +134,27 @@ def url_escape(filename):
 	return quote(filename.encode("utf8"))
 
 
-
-@app.route("/")
-def root():
-	s = K.get_state()
-	return render_template(
-		"index.html",
-		getString1 = lambda ii: getString1(request.client_lang, ii),
-		show_transpose = True,
-		transpose_value = K.now_playing_transpose,
-		volume = s['volume'],
-		seektrack_value = s['time'],
-		seektrack_max = s['length'],
-		audio_delay = s['audiodelay'],
-		play_speed = s['rate'],
-		audio_track_index = K.audio_track_index,
-		audio_track_total = K.audio_track_total,
-	)
-
-@app.route("/home")
-def home():
-	s = K.get_state()
-	return render_template(
-		"home.html",
-		getString1 = lambda ii: getString1(request.client_lang, ii),
-		show_transpose = True,
-		transpose_value = K.now_playing_transpose,
-		volume = s['volume'],
-		seektrack_value = s['time'],
-		seektrack_max = s['length'],
-		audio_delay = s['audiodelay'],
-		play_speed = s['rate'],
-		audio_track_index = K.audio_track_index,
-		audio_track_total = K.audio_track_total,
-	)
-@app.route("/f_home")
-def f_home():
-	ip2pane[request.remote_addr] = 'home'
-	s = K.get_state()
-	return render_template(
-		"f_home.html",
-		getString1 = lambda ii: getString1(request.client_lang, ii),
-		show_transpose = True,
-		transpose_value = K.now_playing_transpose,
-		volume = s['volume'],
-		seektrack_value = s['time'],
-		seektrack_max = s['length'],
-		audio_delay = s['audiodelay'],
-		play_speed = s['rate'],
-		audio_track_index = K.audio_track_index,
-		audio_track_total = K.audio_track_total,
-	)
+def get_player_template_context(client_lang):
+	with K.state_lock:
+		s = K.get_state()
+		return {
+			"getString1": lambda ii: getString1(client_lang, ii),
+			"show_transpose": True,
+			"transpose_value": K.now_playing_transpose,
+			"volume": s['volume'],
+			"seektrack_value": s['time'],
+			"seektrack_max": s['length'],
+			"audio_delay": s['audiodelay'],
+			"play_speed": s['rate'],
+			"audio_track_index": K.audio_track_index,
+			"audio_track_total": K.audio_track_total,
+		}
 
 
-@app.route("/nowplaying")
-def nowplaying(return_json=True):
-	try:
+def get_nowplaying_snapshot():
+	with K.state_lock:
 		if K.switchingSong:
-			return "" if return_json else {}
+			return {}
 		next_song = K.queue[0]["title"] if K.queue else None
 		next_user = K.queue[0]["user"] if K.queue else None
 		s = K.get_state()
@@ -205,11 +172,34 @@ def nowplaying(return_json=True):
 			"vol_norm": K.normalize_vol,
 			"play_speed": s['rate'],
 			"audio_track_index": K.audio_track_index,
-			"audio_track_total": K.audio_track_total
+			"audio_track_total": K.audio_track_total,
 		}
 		if K.has_subtitle:
 			rc['subtitle_delay'] = s['subtitledelay']
 			rc['show_subtitle'] = K.show_subtitle
+		return rc
+
+
+
+@app.route("/")
+def root():
+	return render_template("index.html", **get_player_template_context(request.client_lang))
+
+@app.route("/home")
+def home():
+	return render_template("home.html", **get_player_template_context(request.client_lang))
+@app.route("/f_home")
+def f_home():
+	ip2pane[request.remote_addr] = 'home'
+	return render_template("f_home.html", **get_player_template_context(request.client_lang))
+
+
+@app.route("/nowplaying")
+def nowplaying(return_json=True):
+	try:
+		rc = get_nowplaying_snapshot()
+		if not rc:
+			return "" if return_json else {}
 		return json.dumps(rc) if return_json else rc
 	except Exception as e:
 		logging.error(f"Problem loading /nowplaying, pikaraoke may still be starting up: {e}\n{traceback.print_exc()}")

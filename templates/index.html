@@ -80,16 +80,31 @@ tr:nth-child(even) { background-color: rgb(50, 55, 55); }
 		<div class="box" id="container" style="margin-top: 5px;"></div>
 	</div>
 <script>
-var timer, currentUser, ws;
+var timer = null, currentUser, ws;
+var activePaneRequest = null;
+var paneLoadSeq = 0;
 var last_pane = Cookies.get('last_pane') || '/f_home';
 function closeNav(){
 	$(".navbar-burger").removeClass("is-active");
 	$(".navbar-menu").removeClass("is-active");
 }
 function switch_pane(name){
-	clearInterval(timer);
 	var stem = name.split('?')[0];
-	$.get(name, (data)=>{$('#container').html(data);})
+	clearInterval(timer);
+	timer = null;
+	if (activePaneRequest && activePaneRequest.readyState !== 4) {
+		activePaneRequest.abort();
+	}
+	var requestSeq = ++paneLoadSeq;
+	activePaneRequest = $.get(name, (data)=>{
+		if (requestSeq !== paneLoadSeq) return;
+		$('#container').html(data);
+		activePaneRequest = null;
+	}).fail((_xhr, status)=>{
+		if (status !== "abort") {
+			activePaneRequest = null;
+		}
+	});
 	for(var pn of ['home', 'queue', 'browse', 'info'])
 		if(stem.endsWith(pn)){$("#"+pn).addClass("is-active"); last_pane = stem;}
 		else $("#"+pn).removeClass("is-active")

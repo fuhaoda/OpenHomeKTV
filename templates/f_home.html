@@ -17,9 +17,12 @@ var isMobile = checkMobile();
 
 function getSemitonesLabel(value) {return value>0 ? ("+"+value+"{{getString1(91)}}"):(value + "{{getString1(91)}}");}
 function getHHMMSS(value) {return (new Date(value*1000)).toISOString().substr(11, 8)}
+function isActiveHomePane() { return last_pane === '/f_home'; }
 function update(data){
+	if (!isActiveHomePane() || !data) return;
 	try{obj = JSON.parse(data);}
 	catch{console.log(`JSON parse error: ${data}`);return;}
+	if (!obj || Array.isArray(obj) || typeof obj !== "object") return;
 	if (obj.now_playing) {
 	var nowPlayingHtml = `<p style="margin-bottom: 5px">${obj.now_playing}</p>
 		<p class="has-text-success" style="margin-bottom: 5px"><i class="icon icon-adult" title="Current singer"></i>${obj.now_playing_user}</p>`;
@@ -97,7 +100,13 @@ function update(data){
 	if("volume" in obj && !volume_changing)
 		$("#vol").text(obj.volume);
 }
-function getNowPlaying() { $.get('/nowplaying').done(update); }
+function getNowPlaying() {
+	if (!isActiveHomePane()) return;
+	$.get('/nowplaying').done((data) => {
+		if (!isActiveHomePane()) return;
+		update(data);
+	});
+}
 
 function checkUser() {
 	try{ return obj.now_playing_user=='Random' || $('#current-user').text().trim()==obj.now_playing_user; }
@@ -234,7 +243,7 @@ $("#semitones-info").click(() => {showNotification("{{getString1(62)}}","is-info
 $("#playspeed-info").click(() => {showNotification("{{getString1(200)}}","is-info",10000)});
 
 getNowPlaying();
-setInterval(getNowPlaying, 1500);
+timer = setInterval(getNowPlaying, 1500);
 if(isMobile)
 	$("#label-player-control")[0].outerHTML = '<h3 id="label-player-control">{{getString1(73)}}</h3>';
 

@@ -9,6 +9,7 @@ from flask import *
 from flask.logging import logging
 from flask_sock import Sock
 from flask_paginate import Pagination, get_page_parameter
+from simple_websocket.errors import ConnectionClosed
 
 from karaoke import *
 from constants import VERSION
@@ -32,6 +33,26 @@ getString1 = lambda lang, ii: os.langs[lang].get(ii, os.langs['en_US'][ii])
 getString2 = lambda ii: getString1(request.client_lang, ii)
 
 
+def get_system_locale_name():
+	lang, _ = locale.getlocale()
+	if lang:
+		return lang
+	try:
+		current = locale.setlocale(locale.LC_CTYPE)
+	except locale.Error:
+		return None
+	if not current:
+		return None
+	normalized = locale.normalize(current)
+	if normalized:
+		current = normalized
+	if "." in current:
+		current = current.split(".", 1)[0]
+	if "@" in current:
+		current = current.split("@", 1)[0]
+	return current or None
+
+
 # Websocket handler
 @sock.route('/ws_init')
 def ws_init(sock):
@@ -41,9 +62,13 @@ def ws_init(sock):
 		try:
 			cmd = sock.receive()
 			wscmd(key, cmd)
-		except:
+		except ConnectionClosed as exc:
+			logging.debug(f"Websocket closed for {key}: {exc.reason} {exc.message or ''}".strip())
+			break
+		except Exception:
 			traceback.print_exc()
-	ip2websock.pop(key)
+			break
+	ip2websock.pop(key, None)
 
 def wscmd(client_ip, cmd):
 	if cmd.startswith('pop_from_queue '):
@@ -643,6 +668,7 @@ if __name__ == "__main__":
 	default_volume = 0
 	default_splash_delay = 3
 	default_log_level = logging.INFO
+	default_lang = get_system_locale_name()
 
 	default_media_dir = get_default_media_dir()
 	default_vlc_path = get_default_vlc_path(platform)
@@ -684,8 +710,8 @@ if __name__ == "__main__":
 	)
 	parser.add_argument(
 		"-L", "--lang",
-		help = f"Set display language (default: None, set according to the current system locale {locale.getdefaultlocale()[0]})",
-		default = locale.getdefaultlocale()[0],
+		help = f"Set display language (default: None, set according to the current system locale {default_lang})",
+		default = default_lang,
 	)
 	parser.add_argument(
 		"-l", "--log-level",

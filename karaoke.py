@@ -2,6 +2,7 @@ import os, sys, random, time, json
 import logging, socket, subprocess, threading
 import shutil
 import gzip
+import warnings
 from subprocess import check_output
 from collections import *
 from functools import wraps
@@ -10,6 +11,15 @@ import numpy as np
 
 from constants import media_types
 
+# pygame 2.5.x imports pkg_resources during startup, which emits a deprecation
+# warning under modern setuptools. Narrowly suppress that third-party warning
+# so real app warnings remain visible.
+warnings.filterwarnings(
+	"ignore",
+	message="pkg_resources is deprecated as an API.*",
+	category=UserWarning,
+	module="pygame.pkgdata",
+)
 import pygame
 import qrcode
 import arabic_reshaper

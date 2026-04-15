@@ -560,7 +560,8 @@ class Karaoke:
 		logging.info("Clearing queue!")
 		self.queue = []
 		self.update_queue()
-		self.skip()
+		if self.is_file_playing():
+			self.skip()
 
 	@synchronized_state
 	def queue_edit(self, song_file, action, **kwargs):
@@ -581,7 +582,7 @@ class Karaoke:
 			match = [(ii,each) for ii,each in enumerate(self.queue) if song_file in each["file"]]
 			index, song = match[0] if match else (-1, None)
 			if song == None:
-				logging.error("Song not found in queue: " + song["file"])
+				logging.warning("Song not found in queue: %s", song_file)
 				return False
 			if action == "up":
 				if index < 1:
@@ -1024,7 +1025,10 @@ class Karaoke:
 						tm = time.time()
 						while time.time()-tm < self.splash_delay:
 							self.handle_run_loop()
-						head = self.queue.pop(0)
+						with self.state_lock:
+							head = self.queue.pop(0) if self.queue else None
+						if head is None:
+							continue
 						self.play_file(head['file'])
 						if not self.firstSongStarted:
 							self.firstSongStarted = True

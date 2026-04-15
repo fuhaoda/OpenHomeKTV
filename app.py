@@ -303,11 +303,12 @@ def add_random():
 
 @app.route("/queue/edit", methods = ["GET"])
 def queue_edit():
+	is_xhr = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 	action = request.args["action"]
 	if action == "clear":
 		K.queue_clear()
 		flash(getString(6), "is-warning")
-		return redirect(url_for("queue"))
+		return '' if is_xhr else redirect(url_for("queue"))
 	elif action == "move":
 		try:
 			id_from = request.args['from']
@@ -342,7 +343,7 @@ def queue_edit():
 				flash(getString(14) + song, "is-success")
 			else:
 				flash(getString(15) + song, "is-danger")
-	return redirect(url_for("queue"))
+	return '' if is_xhr else redirect(url_for("queue"))
 
 
 @app.route("/enqueue", methods = ["POST", "GET"])

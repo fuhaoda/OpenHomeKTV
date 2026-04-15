@@ -221,7 +221,10 @@ class VLCClient:
 
 	def command(self, command = '', save_status=True):
 		self.last_status_time = time.time()
+		is_status_probe = command in ("", "pl_info")
 		if not self.is_running():
+			if not is_status_probe:
+				logging.debug("Skipping VLC command while player is not running: %s", command)
 			return SimpleNamespace(**{'text': self.last_status_text, 'status_code': 500})
 		last_exc = None
 		for _ in range(10):
@@ -250,8 +253,16 @@ class VLCClient:
 					self.http_host = self.http_hosts[0]
 					self.http_endpoint = "http://%s:%s/requests/status.xml" % (self.http_host, self.port)
 					self.http_command_endpoint = self.http_endpoint + "?command="
+				if is_status_probe and not self.is_running():
+					break
 				time.sleep(0.1)
-		logging.error("No active VLC process. Could not run command: %s (%s)", command, last_exc)
+		if is_status_probe:
+			if not self.is_running():
+				logging.debug("VLC stopped before status probe completed: %s (%s)", command or "status", last_exc)
+			else:
+				logging.debug("VLC status probe failed while player was transitioning: %s (%s)", command or "status", last_exc)
+		else:
+			logging.error("No active VLC process. Could not run command: %s (%s)", command, last_exc)
 		return SimpleNamespace(**{'text': self.last_status_text, 'status_code': 500})
 
 	def pause(self, save_status=True):

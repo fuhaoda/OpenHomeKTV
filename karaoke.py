@@ -9,7 +9,7 @@ from functools import wraps
 
 import numpy as np
 
-from constants import media_types
+from lib.media import iter_media_files
 
 # pygame 2.5.x imports pkg_resources during startup, which emits a deprecation
 # warning under modern setuptools. Narrowly suppress that third-party warning
@@ -357,25 +357,21 @@ class Karaoke:
 
 	def get_available_songs(self):
 		logging.info("Fetching available songs in: " + ", ".join(self.media_paths))
-		self.songname_trans = {}
+		songname_trans = {}
 		ordered_files = []
+		seen_directories = set()
 		for media_dir in self.media_paths:
-			if not os.path.isdir(media_dir):
-				logging.warning("Media path not found: %s", media_dir)
-				continue
 			files_in_dir = []
-			for bn in os.listdir(media_dir):
-				fn = os.path.join(media_dir, bn)
-				if not bn.startswith('.') and os.path.isfile(fn):
-					if os.path.splitext(fn)[1].lower() in media_types:
-						files_in_dir.append(fn)
-						trans = unidecode(self.filename_from_path(fn)).lower()
-						while trans and not trans[0].islower() and not trans[0].isdigit():
-							trans = trans[1:]
-						self.songname_trans[fn] = trans
-			files_in_dir.sort(key=lambda f: self.songname_trans.get(f, os.path.basename(f).lower()))
+			for fn in iter_media_files(media_dir, seen_directories):
+				files_in_dir.append(fn)
+				trans = unidecode(self.filename_from_path(fn)).lower()
+				while trans and not trans[0].islower() and not trans[0].isdigit():
+					trans = trans[1:]
+				songname_trans[fn] = trans
+			files_in_dir.sort(key=lambda f: (songname_trans[f], f))
 			ordered_files.extend(files_in_dir)
 
+		self.songname_trans = songname_trans
 		self.available_songs = ordered_files
 
 	def get_all_assoc_files(self, song_path):

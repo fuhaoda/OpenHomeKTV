@@ -3,7 +3,7 @@
 Local-file karaoke player with a simple web UI and VLC playback.
 
 ## Features
-- Browse and queue local media files (no recursion).
+- Browse and queue local video files from folders and all their subfolders.
 - VLC playback.
 - Next Audio Track button with current track display (for example `1/3`).
 
@@ -28,9 +28,12 @@ mv_path_1=/path/to/another-folder
 ```
 
 Notes:
-- Only the root of each folder is scanned (no recursion).
-- Files are sorted by filename within each folder, then appended in the order listed in `media_paths.conf`.
-- Supported extensions: `.mp4`, `.mp3`, `.zip`, `.mkv`, `.avi`, `.webm`, `.mov`, `.m4a`.
+- Each configured folder is scanned recursively at startup and when the existing Refresh action is used. You only need to list the parent folder: `/KTV/Artist/Album/song.mkv` is found when `/KTV` is configured.
+- Only video extensions are included (case-insensitive): `.mkv`, `.mpg`, `.mpeg`, `.mp4`, `.avi`, `.mov`, `.webm`, `.m4v`, `.wmv`, `.flv`, `.vob`, `.ts`, `.m2ts`. Audio files, ZIP archives, text, HTML, subtitles, and unknown extensions are excluded.
+- Scanning uses filenames and filesystem metadata without opening media files or probing their contents.
+- Hidden files and hidden subfolders are skipped. Directory symlinks are not followed. Unreadable folders are logged and skipped so scanning can continue.
+- Videos are sorted by song title across each configured folder and its subfolders, with the full path breaking ties. The configured folder order is preserved.
+- Overlapping configured folders list each file path once. Separate files with the same filename remain separate songs. The phone displays song titles from filenames, without directory names.
 
 If `media_paths.local.conf` is missing or empty, the app uses `media_paths.conf`. If both are missing or empty, it falls back to `~/openhomekaraoke-media/`.
 

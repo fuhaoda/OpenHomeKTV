@@ -110,7 +110,12 @@ html, body {
 #current-user span { overflow-wrap: anywhere; }
 .song-title, .song-singer { display: block; line-height: 1.35; }
 .song-singer { margin-top: .25rem; font-size: .9em; }
-.song-summary { min-width: 0; }
+.song-summary {
+  min-width: 0;
+  line-height: 1.45;
+  padding: .125rem 0 .375rem;
+}
+.song-summary + .player-divider { margin: .75rem 0; }
 .player-controls-header { flex-wrap: wrap; gap: .6rem; }
 .player-controls-header > * { min-width: 0; }
 .player-controls-header > .is-flex { flex-wrap: wrap; }

@@ -1,0 +1,36 @@
+<div id="queue-pane" class="queue-pane">
+  <table class="table is-striped queue-table" id="auto-refresh" aria-label="{{getString1(112)}}"></table>
+  <div class="queue-tools">
+    <button type="button" class="queue-random button is-small is-text has-text-success">
+      <i class="icon icon-plus-circled" aria-hidden="true"></i>{{getString1(109)}}
+    </button>
+    <button type="button" class="queue-clear button is-small is-text has-text-danger">
+      <i class="icon icon-trash-empty" aria-hidden="true"></i>{{getString1(110)}}
+    </button>
+  </div>
+</div>
+<script>
+(function () {
+  var isSpa = typeof switch_pane === 'function';
+  var controller = KTV.startQueue({
+    isActive: function () { return !isSpa || last_pane === '/f_queue'; },
+    labels: {
+      up: {{getString1(105)|tojson}}, down: {{getString1(106)|tojson}},
+      remove: {{getString1(113)|tojson}}, empty: {{getString1(111)|tojson}}
+    },
+    confirmDelete: {{getString1(107)|tojson}}
+  });
+  window.updateQueue = controller.update;
+  if (isSpa) window.paneCleanup = controller.stop;
+  var pane = document.getElementById('queue-pane');
+  pane.querySelector('.queue-random').addEventListener('click', function () {
+    $.get('/queue/addrandom', {amount: 3}).fail(KTV.showRequestError).always(controller.refresh);
+  });
+  pane.querySelector('.queue-clear').addEventListener('click', function () {
+    if (window.confirm({{getString1(108)|tojson}})) {
+      $.get('/queue/edit', {action: 'clear'}).fail(KTV.showRequestError).always(controller.refresh);
+    }
+  });
+  if (!isSpa) window.addEventListener('pagehide', controller.stop, {once: true});
+}());
+</script>

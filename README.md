@@ -13,7 +13,8 @@ Local-file karaoke player with a simple web UI and VLC playback.
 
 ## Install
 ```
-python3 -m pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
 ## Configure media folders
@@ -34,24 +35,44 @@ Notes:
 - Hidden files and hidden subfolders are skipped. Directory symlinks are not followed. Unreadable folders are logged and skipped so scanning can continue.
 - Videos are sorted by song title across each configured folder and its subfolders, with the full path breaking ties. The configured folder order is preserved.
 - Overlapping configured folders list each file path once. Separate files with the same filename remain separate songs. The phone displays song titles from filenames, without directory names.
+- Date sorting reads filesystem timestamps only when needed and caches them until Refresh. Searching first narrows the files whose timestamps are needed. Refresh updates the library after adding, removing, or moving files.
 
 If `media_paths.local.conf` is missing or empty, the app uses `media_paths.conf`. If both are missing or empty, it falls back to `~/openhomekaraoke-media/`.
 
 ## Run
+From the repository folder, start with one command:
 ```
-python3 app.py
+./start.sh
 ```
-To use a different port:
+The script activates `.venv`, changes to the repository directory, and passes arguments to the app. It also works from another directory when invoked by its full path. Stop the app with Ctrl+C.
+
+To use a different port or initial volume (VLC volume scale `0..512`; the default is muted):
 ```
-python3 app.py --port 5010
+./start.sh --port 5010 --volume 128
 ```
 To quickly point at a single media folder (instead of editing the config files):
 ```
-python3 app.py --media-path /path/to/your/mkv-folder
+./start.sh --media-path "/path/to/your/video folder"
 ```
+For a different virtual environment, set `OPENHOMEKTV_VENV=/path/to/venv` before running the script. If the environment is missing, the script prints setup commands and exits. It does not install packages automatically. Direct startup with `.venv/bin/python app.py` also works.
 
 ## Audio tracks
 The UI shows a "Next Audio Track" button and the current track count (for example `1/2`).
 - Clicking cycles through tracks: 1 -> 2 -> 3 -> 1 ...
 - If only one track exists, it stays at `1/1` and the button is disabled.
-- On song change, it resets to track 1.
+- On a new song, the second track is selected when available; a single-track file uses track 1.
+- Switching audio tracks or changing pitch while paused keeps playback paused.
+
+## Playback and phone controls
+- A failed or unavailable video is logged and skipped so the remaining queue can continue. Player startup and media probes have timeouts.
+- Phone queues fit narrow screens, wrap long song and singer names, and keep the usual browser zoom available.
+- Browser updates use JSON messages with reconnect and polling fallback. Multiple tabs on one phone have independent connections.
+- Saved audio/subtitle delays distinguish videos with identical filenames in different folders. Existing filename-based settings remain readable; updates are saved by full path.
+- Optional volume normalization needs FFmpeg on `PATH`. It analyzes up to the first 60 seconds of a selected song on demand, with a 45-second timeout, and caches the result. It does not analyze the whole library during scanning.
+
+## Development checks
+```
+.venv/bin/python -m unittest discover -s tests -v
+node tests/test_frontend.js
+bash -n start.sh
+```

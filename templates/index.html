@@ -12,6 +12,8 @@
 	<script src="/static/jquery-ui.min.js"></script>
 	<script src="/static/js.cookie-2.2.1.min.js"></script>
 	<script src="/static/lodash.min.js"></script>
+	<script src="/static/jquery.ui.touch-punch.min.js"></script>
+	<script src="/static/app.js"></script>
 	<link rel="stylesheet" href="/static/jquery-ui.min.css">
 	<link rel="stylesheet" href="/static/bulma-dark.css">
 	<link rel="stylesheet" href="/static/custom.css">
@@ -21,13 +23,10 @@
 
 <style>
 .navbar-item > i { margin-right: 2px; font-size: 24px; }
-.notification { position: fixed; width: 500px; bottom: 5px; left: 50%; margin-left: -250px; z-index: 20; }
 .current-user { position: fixed; padding: 3px; bottom: 5px; right: 10px; }
 tr:nth-child(even) { background-color: rgb(50, 55, 55); }
 @media screen and (max-width: 500px) {
 	.navbar-brand > .navbar-item > span { display: none; }
-	.notification { position: fixed; width: 100%; bottom: 5px; left: 0px; margin-left: 0px; }
-	body { min-height: 120vh; }
 }
 .hide {display: none;}
 .hand {cursor: pointer;}
@@ -80,128 +79,143 @@ tr:nth-child(even) { background-color: rgb(50, 55, 55); }
 		<div class="box" id="container" style="margin-top: 5px;"></div>
 	</div>
 <script>
-var timer = null, currentUser, ws;
-var activePaneRequest = null;
-var paneLoadSeq = 0;
+var timer = null, currentUser, ws = null, paneCleanup = null;
+var activePaneRequest = null, paneLoadSeq = 0;
 var last_pane = Cookies.get('last_pane') || '/f_home';
-function closeNav(){
-	$(".navbar-burger").removeClass("is-active");
-	$(".navbar-menu").removeClass("is-active");
+var reconnectTimer = null, reconnectDelay = 1000, closingPage = false;
+var notificationTimer = null;
+function closeNav() {
+  $('.navbar-burger, .navbar-menu').removeClass('is-active');
 }
-function switch_pane(name){
-	var stem = name.split('?')[0];
-	clearInterval(timer);
-	timer = null;
-	if (activePaneRequest && activePaneRequest.readyState !== 4) {
-		activePaneRequest.abort();
-	}
-	var requestSeq = ++paneLoadSeq;
-	activePaneRequest = $.get(name, (data)=>{
-		if (requestSeq !== paneLoadSeq) return;
-		$('#container').html(data);
-		activePaneRequest = null;
-	}).fail((_xhr, status)=>{
-		if (status !== "abort") {
-			activePaneRequest = null;
-		}
-	});
-	for(var pn of ['home', 'queue', 'browse', 'info'])
-		if(stem.endsWith(pn)){$("#"+pn).addClass("is-active"); last_pane = stem;}
-		else $("#"+pn).removeClass("is-active")
-	closeNav();
+function switch_pane(name) {
+  var target = new URL(name, location.href);
+  if (target.origin !== location.origin || !['/f_home', '/f_queue', '/f_browse', '/f_info'].includes(target.pathname)) {
+    target = new URL('/f_home', location.origin);
+  }
+  var stem = target.pathname;
+  clearInterval(timer);
+  timer = null;
+  if (typeof paneCleanup === 'function') paneCleanup();
+  paneCleanup = null;
+  $(document).off('scroll.ktvBrowse');
+  if (activePaneRequest && activePaneRequest.readyState !== 4) activePaneRequest.abort();
+  var requestSeq = ++paneLoadSeq;
+  last_pane = stem;
+  ['home', 'queue', 'browse', 'info'].forEach(function (pane) {
+    $('#' + pane).toggleClass('is-active', stem === '/f_' + pane);
+  });
+  activePaneRequest = $.get(target.pathname + target.search).done(function (data) {
+    if (requestSeq !== paneLoadSeq) return;
+    $('#container').html(data);
+    activePaneRequest = null;
+  }).fail(function (_xhr, status) {
+    if (requestSeq === paneLoadSeq && status !== 'abort') activePaneRequest = null;
+  });
+  closeNav();
 }
-get_refresh = (url, pane=last_pane)=>{$.get(url, (_)=>{switch_pane(pane)});}
-post_switch = (url, data)=>{$.post(url, data, (_)=>{
-	clearInterval(timer);
-	$('#container').html(_);
-	closeNav();
-})}
-function showNotification(message, categoryClass, timeout=3000) {
-	$("#notification").addClass(categoryClass)
-	$("#notification div").text(message)
-	$("#notificationControls").hide()
-	$("#notification").fadeIn()
-	setTimeout(function () {$("#notification").fadeOut()}, timeout)
-	setTimeout(function () {$("#notification").removeClass(categoryClass)}, timeout + 750)
+function get_refresh(url, pane) {
+  $.get(url).done(function () { switch_pane(pane || last_pane); }).fail(KTV.showRequestError);
 }
-
-function notifyWithControl(message, action, timeout=3000){
-	$("#notification").addClass('is-info')
-	$("#notification div").text(message)
-	$("#notificationControls").show()
-	$("#notificationControls").click(action)
-	$("#notification").fadeIn()
-	setTimeout(function () {$("#notification").fadeOut()}, timeout)
-	setTimeout(function () {$("#notification").removeClass('is-info')}, timeout + 750)
+function post_switch(url, data) {
+  $.post(url, data).done(function () { switch_pane(last_pane); }).fail(KTV.showRequestError);
 }
-
-function setLanguage(lang, reload){
-	Cookies.set("lang", lang, { expires: 3650 });
-	Cookies.set("last_pane", last_pane);
-	if(reload){
-		window.scrollTo(0, 0);
-		location.reload();
-	}
+function showNotification(message, categoryClass, timeout) {
+  clearTimeout(notificationTimer);
+  var notification = $('#notification');
+  notification.stop(true, true).removeClass('is-info is-success is-warning is-danger').addClass(categoryClass || 'is-info');
+  notification.find('.flash').text(message == null ? '' : message);
+  $('#notificationControls').hide().off('click.ktv');
+  notification.show();
+  notificationTimer = setTimeout(function () { notification.fadeOut(); }, timeout || 3000);
 }
-
-// Check for click events on the navbar burger icon
-$(".navbar-burger").click(function () {
-	// Toggle the "is-active" class on both the "navbar-burger" and the "navbar-menu"
-	$(".navbar-burger").toggleClass("is-active");
-	$(".navbar-menu").toggleClass("is-active");
+function notifyWithControl(message, action, timeout) {
+  showNotification(message, 'is-info', timeout);
+  $('#notificationControls').show().off('click.ktv').on('click.ktv', action);
+}
+function setLanguage(lang, reload) {
+  Cookies.set('lang', lang, {expires: 3650});
+  Cookies.set('last_pane', last_pane);
+  if (reload) { window.scrollTo(0, 0); location.reload(); }
+}
+$('.navbar-burger').on('click', function () {
+  $('.navbar-burger, .navbar-menu').toggleClass('is-active');
 });
-
-
-// handle current user display
-function set_user(user){
-	currentUser = user;
-	Cookies.set("user", currentUser, { expires: 3650 });
-	$("#current-user span").text(currentUser);
+function set_user(user) {
+  currentUser = user;
+  Cookies.set('user', currentUser, {expires: 3650});
+  $('#current-user span').text(currentUser);
 }
-function load_cur_user(){
-	currentUser = Cookies.get("user");
-	if(currentUser==null)
-		$.get('/auto_username').then((s)=>{set_user(s)});
-	else set_user(currentUser);
+function load_cur_user() {
+  var user = Cookies.get('user');
+  if (user == null) $.get('/auto_username').done(set_user);
+  else set_user(user);
 }
-
-$('#current-user').click(function(e) {
-	e.preventDefault();
-	let name = window.prompt("{{getString1(133)}}" + currentUser, currentUser);
-	if (name) {
-		$.get(`/user_rename/${currentUser}/${name}`);
-		set_user(name);
-		closeNav();
-	}
+$('#current-user').on('click', function (event) {
+  event.preventDefault();
+  var name = window.prompt({{getString1(133)|tojson}} + (currentUser || ''), currentUser);
+  if (name) {
+    $.post('/user_rename', {old_name: currentUser || '', new_name: name}).done(function () {
+      set_user(name); closeNav();
+    }).fail(KTV.showRequestError);
+  }
 });
-
-// handle browser language
 load_cur_user();
-var currentLang = Cookies.get("lang");
-if(!currentLang){
-	currentLang = window.navigator.language;
-	setLanguage(currentLang, false);
-}
-
-$('#current-lang').click(function(e) {
-	e.preventDefault();
-	$.get('/get_lang_list').done(function(lang_json){
-		var lang_dict = JSON.parse(lang_json);
-		var popup_html = '';
-		for(var lang1 in lang_dict){
-			popup_html += `<input type="radio" onclick="setLanguage('${lang1}', true);" ${currentLang==lang1?"checked":""}>&nbsp;${lang_dict[lang1]}<br>`;
-		}
-		var popUpList = $(`<div title="{{getString1(185)}}">${popup_html}</div>`)
-		popUpList.dialog();
-	});
+var currentLang = Cookies.get('lang');
+if (!currentLang) { currentLang = navigator.language; setLanguage(currentLang, false); }
+$('#current-lang').on('click', function (event) {
+  event.preventDefault();
+  $.get('/get_lang_list').done(function (data) {
+    var languages = KTV.parseData(data);
+    if (!languages || typeof languages !== 'object') return;
+    var popup = $('<div>').attr('title', {{getString1(185)|tojson}});
+    Object.keys(languages).forEach(function (language) {
+      var label = $('<label>').addClass('language-choice');
+      $('<input>', {type: 'radio', name: 'language', checked: currentLang === language})
+        .on('change', function () { setLanguage(language, true); }).appendTo(label);
+      label.append(document.createTextNode(' ' + languages[language])).appendTo(popup);
+    });
+    popup.dialog({width: Math.min(400, window.innerWidth - 24), close: function () { popup.dialog('destroy').remove(); }});
+  });
 });
-function open_wsock_if_nec(){
-	if(ws==null || ws.readyState>1){
-		ws = new WebSocket((window.location.href.startsWith('https:')?'wss://':'ws://') + location.host + '/ws_init');
-		ws.addEventListener('message', ev => {setTimeout(ev.data, 1);});
-	}
-	return ws;
+function handleSocketMessage(raw) {
+  KTV.dispatchMessage(raw, {
+    nowplaying: function (data) {
+      if (last_pane === '/f_home' && typeof window.updateNowPlaying === 'function') window.updateNowPlaying(data);
+    },
+    queue: function (data) {
+      if (last_pane === '/f_queue' && typeof window.updateQueue === 'function') window.updateQueue(data);
+    },
+    notification: function (data) {
+      if (data && typeof data.message === 'string') showNotification(data.message, data.category);
+    }
+  });
 }
+function open_wsock_if_nec() {
+  if (closingPage || (ws && ws.readyState < 2)) return ws;
+  var socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws_init');
+  ws = socket;
+  socket.addEventListener('open', function () { reconnectDelay = 1000; });
+  socket.addEventListener('message', function (event) { handleSocketMessage(event.data); });
+  socket.addEventListener('error', function () { socket.close(); });
+  socket.addEventListener('close', function () {
+    if (ws === socket) ws = null;
+    if (closingPage || reconnectTimer !== null) return;
+    reconnectTimer = setTimeout(function () { reconnectTimer = null; open_wsock_if_nec(); }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  });
+  return socket;
+}
+window.addEventListener('pagehide', function () {
+  closingPage = true;
+  clearTimeout(reconnectTimer);
+  if (ws) ws.close();
+  clearInterval(timer);
+  if (typeof paneCleanup === 'function') paneCleanup();
+});
+window.addEventListener('pageshow', function (event) {
+  if (event.persisted) { closingPage = false; reconnectTimer = null; open_wsock_if_nec(); switch_pane(last_pane); }
+});
+document.addEventListener('visibilitychange', function () { if (!document.hidden) open_wsock_if_nec(); });
 open_wsock_if_nec();
 switch_pane(last_pane);
 </script>

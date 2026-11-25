@@ -75,15 +75,16 @@
 <p class="pagination-page-info">
   {{ getString1(234).format(per_page=results_per_page, record_name=getString1(101)) }}
 </p>
-<table>
+<table class="browse-table">
   {% for song in songs %}
-  <tr value='{{ song }}'>
+  <tr>
     <td width="20px" style="padding: 5px 0px">{{loop.index + pagination.skip}}</td>
-    <td id={{filename_from_path(song)[0].lower()}} width="20px" style="padding: 5px 0px">
+    <td width="20px" style="padding: 5px 0px">
       <a class='add-song-link has-text-weight-bold has-text-success' title="{{getString1(97)%filename_from_path(song)}}"
-        href="{{url_for('enqueue')}}?song={{url_escape(song.encode('utf-8'))}}&user="><i class="icon icon-list-add"></i> </a>
+        href="{{url_for('enqueue')}}" data-file="{{song}}"><i class="icon icon-list-add"></i> </a>
     </td>
     <td>{{filename_from_path(song)}}</td>
+  </tr>
     {% endfor %}
 </table>
 {{ pagination.links }}
@@ -110,7 +111,7 @@ $('#browse-search-form').on('submit', function(e) {
 });
 
 if ($(window).width() <= 500) {
-  $(document).scroll(function() {
+  $(document).off('scroll.ktvBrowse').on('scroll.ktvBrowse', function() {
     var y = $(this).scrollTop();
     if (y > 100) {
       $('#alpha-bar').removeClass("mobile-hide");
@@ -121,23 +122,19 @@ if ($(window).width() <= 500) {
   });
 }
 
-$('a.add-song-link').click(function(e) {
-  e.preventDefault();
-  var user = Cookies.get("user") 
+$('a.add-song-link').on('click', function(event) {
+  event.preventDefault();
+  var user = Cookies.get('user');
   if (!user) {
-    let name = window.prompt("{{getString1(92)}}");
-    if (name) {
-      Cookies.set("user", name, { expires: 3650 })
-      user = Cookies.get("user") 
-    }
+    user = window.prompt({{getString1(92)|tojson}});
+    if (!user) return;
+    Cookies.set('user', user, {expires: 3650});
   }
-  $.get(this.href + encodeURIComponent(user), function (data) {
-    var obj = JSON.parse(data);
-    if (obj.success)
-      showNotification("{{getString1(93)}}" + obj.song, "is-success")
-    else
-      showNotification("{{getString1(94)}}" + obj.song, "is-danger")
-  })
-})
-
+  $.get('/enqueue', {song: this.dataset.file, user: user}).done(function(data) {
+    var result = KTV.parseData(data);
+    if (!result) return;
+    showNotification((result.success ? {{getString1(93)|tojson}} : {{getString1(94)|tojson}}) + result.song,
+      result.success ? 'is-success' : 'is-danger');
+  }).fail(KTV.showRequestError);
+});
 </script>

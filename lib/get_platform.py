@@ -33,7 +33,7 @@ Simplified Chinese,zh_CN
 
 def find_language(lang):
 	check_lang = lambda L: L if L in os.langs else None
-	lang = lang.replace('-', '_')
+	lang = (lang or 'en_US').replace('-', '_')
 	found = check_lang(lang)
 	if not found:
 		prefix = lang.split("_")[0]
@@ -51,14 +51,21 @@ def set_language(lang):
 	if not hasattr(os, 'langs'):
 		iso2name = {p[1]: p[0] for L in lang_iso_name.strip().splitlines() for p in [L.strip().split(',')]}
 		iso2popularity = defaultdict(lambda: 0, {k: lang_popularity[v] for k, v in iso2name.items()})
-		loadf = lambda f: defaultdict(lambda: "", {ii: L for ii, L in enumerate([''] + open(f, 'rb').read().decode('utf-8', 'ignore').splitlines())})
-		sorted_lang_list = sorted(os.listdir('lang'), key = lambda t: iso2popularity.get(t, iso2popularity[t.split('_')[0]]), reverse=True)
-		os.langs = {f: loadf('lang/' + f) for f in sorted_lang_list if os.path.getsize('lang/' + f) and not f.startswith('.')}
+		def loadf(filename):
+			with open(filename, encoding='utf-8', errors='ignore') as stream:
+				return defaultdict(lambda: '', enumerate([''] + stream.read().splitlines()))
+		lang_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'lang')
+		sorted_lang_list = sorted(os.listdir(lang_dir), key = lambda t: iso2popularity.get(t, iso2popularity[t.split('_')[0]]), reverse=True)
+		os.langs = {f: loadf(os.path.join(lang_dir, f)) for f in sorted_lang_list if not f.startswith('.') and os.path.isfile(os.path.join(lang_dir, f)) and os.path.getsize(os.path.join(lang_dir, f))}
 	new_lang = find_language(lang)
 	if not new_lang:
 		raise Exception(f"Language file lang/{lang} not found")
 	os.lang = new_lang
 	os.texts = os.langs[new_lang]
+
+
+def getString(index):
+	return getattr(os, 'texts', {}).get(index, '')
 
 
 def escape_win_filename(fn):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import argparse, json, locale, os, sys, shutil
+import argparse, json, locale, os, sys, shutil, math, signal
 import threading, time, traceback
 from functools import wraps
 
@@ -11,11 +11,15 @@ from flask_sock import Sock
 from flask_paginate import Pagination, get_page_parameter
 from simple_websocket.errors import ConnectionClosed
 
-from karaoke import *
+from karaoke import Karaoke
 from constants import VERSION
 from collections import defaultdict
 from lib.get_platform import *
-from lib.vlcclient import get_default_vlc_path
+from lib.vlcclient import get_default_vlc_path, PlaybackError
+from lib.media import media_title
+from lib.events import (
+	broadcast, flash, ip2websock, register_client, send_client, unregister_client,
+)
 
 try:
 	from urllib.parse import quote, unquote
@@ -27,10 +31,17 @@ app.config['TEMPLATES_AUTO_RELOAD'] = True	##DEBUG
 app.secret_key = os.urandom(24)
 K = args = None
 sock = Sock(app)
-os.texts = defaultdict(lambda: "")
-getString = lambda ii: os.texts[ii]
+if not hasattr(os, 'texts'):
+	os.texts = defaultdict(lambda: "")
 getString1 = lambda lang, ii: os.langs[lang].get(ii, os.langs['en_US'][ii])
 getString2 = lambda ii: getString1(request.client_lang, ii)
+
+
+@app.errorhandler(PlaybackError)
+def playback_error(error):
+	logging.warning('Playback request failed: %s', error)
+	flash(str(error), 'is-warning')
+	return jsonify(success=False, error=str(error)), 503
 
 
 def get_system_locale_name():
@@ -56,21 +67,31 @@ def get_system_locale_name():
 # Websocket handler
 @sock.route('/ws_init')
 def ws_init(sock):
-	key = sock.sock.getpeername()[0]
-	ip2websock[key] = sock
-	while sock.connected:
-		try:
+	client_ip = request.remote_addr or ''
+	client_id = register_client(sock, client_ip)
+	try:
+		if K is not None:
+			with K.state_lock:
+				queue_snapshot = [dict(item) for item in K.queue]
+			send_client(client_id, {'type': 'queue', 'data': queue_snapshot})
+			status = get_nowplaying_snapshot()
+			if status:
+				send_client(client_id, {'type': 'nowplaying', 'data': status})
+		while sock.connected:
 			cmd = sock.receive()
-			wscmd(key, cmd)
-		except ConnectionClosed as exc:
-			logging.debug(f"Websocket closed for {key}: {exc.reason} {exc.message or ''}".strip())
-			break
-		except Exception:
-			traceback.print_exc()
-			break
-	ip2websock.pop(key, None)
+			if cmd is None:
+				break
+			wscmd(client_ip, cmd)
+	except ConnectionClosed:
+		logging.debug("Browser disconnected: %s", client_id)
+	except Exception:
+		logging.exception("Browser connection failed: %s", client_id)
+	finally:
+		unregister_client(client_id)
 
 def wscmd(client_ip, cmd):
+	if not isinstance(cmd, str):
+		return
 	if cmd.startswith('pop_from_queue '):
 		name = cmd.split(' ', 1)[1]
 		K.queue_edit(name, 'delete')
@@ -80,41 +101,23 @@ def wscmd(client_ip, cmd):
 			K.enqueue(fn, lst[0])
 
 def status_thread():
-	cached_status = ''
+	cached_status = cached_queue = None
 	while True:
 		K.event_dirty.wait(1)
-
-		status = get_nowplaying_snapshot()
-		if not status: continue
-
-		status_full = json.dumps(status)
-		status.pop('seektrack_value', None)
-		status_str = json.dumps(status)
-		with K.state_lock:
-			if status_str != cached_status:
-				K.status_dirty = True
-				cached_status = status_str
-			dirty = K.status_dirty
-
-		if not dirty:
+		K.event_dirty.clear()
+		try:
+			status = get_nowplaying_snapshot()
 			with K.state_lock:
-				if not K.is_file_playing():
-					continue
-				tm = K.get_state().get('time', None)
-			if tm is None:
-				continue
-			for ip, ws in ip2websock.items():
-				if ip2pane.get(ip, '') == 'home':
-					ws.send(f"seektrack.value={tm};$('#seektrack-val').text(getHHMMSS({tm}));")
-			continue
-
-		for ip, ws in ip2websock.items():
-			if ip2pane.get(ip, '') == 'home':
-				ws.send(f"update('{status_full}')")
-			elif ip2pane.get(ip, '') == 'queue':
-				ws.send(f"update('{K.queue_json}')")
-		with K.state_lock:
-			K.status_dirty = False
+				queue_snapshot = [dict(item) for item in K.queue]
+			if status and status != cached_status:
+				broadcast({'type': 'nowplaying', 'data': status})
+				cached_status = status
+			if queue_snapshot != cached_queue:
+				broadcast({'type': 'queue', 'data': queue_snapshot})
+				cached_queue = queue_snapshot
+		except Exception:
+			# One transient player response must not stop every phone's updates.
+			logging.exception("Unable to publish player status")
 
 # Define global symbols for Jinja templates 
 @app.context_processor
@@ -135,14 +138,7 @@ def preprocessor():
 
 
 def filename_from_path(file_path, strip_suffix = True):
-	rc = os.path.basename(file_path)
-	rc = os.path.splitext(rc)[0]
-	if strip_suffix:
-		try:
-			rc = rc.split("---")[0]
-		except TypeError:
-			rc = rc.split("---".encode("utf-8"))[0]
-	return rc
+	return media_title(file_path, strip_suffix)
 
 
 def filename_for_search(file_path):
@@ -159,9 +155,16 @@ def url_escape(filename):
 	return quote(filename.encode("utf8"))
 
 
+app.jinja_env.globals.update(filename_from_path=filename_from_path, url_escape=quote)
+
+
 def get_player_template_context(client_lang):
 	with K.state_lock:
-		s = K.get_state()
+		generation = (K.now_playing_filename, getattr(K.vlcclient, 'playback_generation', None))
+	s = K.get_state()
+	with K.state_lock:
+		if K.switchingSong or generation != (K.now_playing_filename, getattr(K.vlcclient, 'playback_generation', None)):
+			s = {'volume': K.volume, 'time': 0, 'length': 0, 'audiodelay': K.audio_delay, 'rate': K.play_speed}
 		return {
 			"getString1": lambda ii: getString1(client_lang, ii),
 			"show_transpose": True,
@@ -178,11 +181,13 @@ def get_player_template_context(client_lang):
 
 def get_nowplaying_snapshot():
 	with K.state_lock:
-		if K.switchingSong:
+		generation = (K.now_playing_filename, getattr(K.vlcclient, 'playback_generation', None))
+	s = K.get_state()
+	with K.state_lock:
+		if K.switchingSong or generation != (K.now_playing_filename, getattr(K.vlcclient, 'playback_generation', None)):
 			return {}
 		next_song = K.queue[0]["title"] if K.queue else None
 		next_user = K.queue[0]["user"] if K.queue else None
-		s = K.get_state()
 		rc = {
 			"now_playing": K.now_playing,
 			"now_playing_user": K.now_playing_user,
@@ -215,7 +220,6 @@ def home():
 	return render_template("home.html", **get_player_template_context(request.client_lang))
 @app.route("/f_home")
 def f_home():
-	ip2pane[request.remote_addr] = 'home'
 	return render_template("f_home.html", **get_player_template_context(request.client_lang))
 
 
@@ -250,17 +254,20 @@ def change_language(language):
 	return os.lang
 
 
+@app.route("/user_rename", methods=['POST'])
 @app.route("/user_rename/<old_name>/<new_name>")
-def user_rename(old_name, new_name):
-	dirty = False
-	for q in K.queue:
-		if q['user'] == old_name:
-			q['user'] = new_name
-			dirty = True
-	if K.now_playing_user == old_name:
-		K.now_playing_user = new_name
-		K.status_dirty = True
-	if dirty:
+def user_rename(old_name=None, new_name=None):
+	if request.method == 'POST':
+		data = request.get_json(silent=True) if request.is_json else request.form
+		old_name, new_name = (data or {}).get('old_name'), (data or {}).get('new_name')
+	if not isinstance(old_name, str) or not isinstance(new_name, str) or not new_name.strip():
+		return 'Both user names are required', 400
+	with K.state_lock:
+		for q in K.queue:
+			if q['user'] == old_name:
+				q['user'] = new_name
+		if K.now_playing_user == old_name:
+			K.now_playing_user = new_name
 		K.update_queue()
 	return ''
 
@@ -281,18 +288,20 @@ def queue():
 	return render_template("queue.html", getString1 = lambda ii: getString1(request.client_lang, ii), queue = K.queue)
 @app.route("/f_queue")
 def f_queue():
-	ip2pane[request.remote_addr] = 'queue'
 	return render_template("f_queue.html", getString1 = lambda ii: getString1(request.client_lang, ii), queue = K.queue)
 
 
 @app.route("/get_queue", methods = ["GET"])
 def get_queue():
-	return K.queue_json
+	with K.state_lock:
+		return json.dumps(K.queue)
 
 
 @app.route("/queue/addrandom", methods = ["GET"])
 def add_random():
-	amount = int(request.args["amount"])
+	amount = request.args.get('amount', type=int)
+	if amount is None or amount < 1 or amount > 100:
+		return 'Amount must be between 1 and 100', 400
 	rc = K.queue_add_random(amount)
 	if rc:
 		flash(getString(4) % amount, "is-success")
@@ -305,8 +314,11 @@ def add_random():
 def queue_edit():
 	is_xhr = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 	action = request.args["action"]
+	if action not in ('clear', 'move', 'up', 'down', 'delete'):
+		return 'Unknown queue action', 400
 	if action == "clear":
-		K.queue_clear()
+		if K.queue_clear() is False:
+			return jsonify(success=False, error='The waiting queue was cleared. The current song is still starting; try Skip again after startup finishes.'), 409
 		flash(getString(6), "is-warning")
 		return '' if is_xhr else redirect(url_for("queue"))
 	elif action == "move":
@@ -314,8 +326,8 @@ def queue_edit():
 			id_from = request.args['from']
 			id_to = request.args['to']
 			id_size = request.args['size']
-		except:
-			flash(getString(7))
+		except KeyError:
+			return 'Move requires from, to and size', 400
 
 		result = K.queue_edit(None, "move", src=id_from, tgt=id_to, size=id_size)
 		if result:
@@ -324,33 +336,37 @@ def queue_edit():
 			flash(f"{getString(9)} {id_from}->{id_to}/{id_size}")
 	else:
 		song = request.args["song"]
-		song = unquote(song)
+		song_title = filename_from_path(song)
+		# Flask has already decoded the query once; a second unquote corrupts
+		# real filenames containing strings such as "%20".
 		if action == "down":
 			result = K.queue_edit(song, "down")
 			if result:
-				flash(getString(10) + song, "is-success")
+				flash(getString(10) + song_title, "is-success")
 			else:
-				flash(getString(11) + song, "is-danger")
+				flash(getString(11) + song_title, "is-danger")
 		elif action == "up":
 			result = K.queue_edit(song, "up")
 			if result:
-				flash(getString(12) + song, "is-success")
+				flash(getString(12) + song_title, "is-success")
 			else:
-				flash(getString(13) + song, "is-danger")
+				flash(getString(13) + song_title, "is-danger")
 		elif action == "delete":
 			result = K.queue_edit(song, "delete")
 			if result:
-				flash(getString(14) + song, "is-success")
+				flash(getString(14) + song_title, "is-success")
 			else:
-				flash(getString(15) + song, "is-danger")
+				flash(getString(15) + song_title, "is-danger")
 	return '' if is_xhr else redirect(url_for("queue"))
 
 
 @app.route("/enqueue", methods = ["POST", "GET"])
 def enqueue():
 	d = request.values.to_dict()
-	song = d['song' if 'song' in d else 'song-to-add']
-	user = d['user' if 'user' in d else 'song-added-by']
+	song = d.get('song', d.get('song-to-add'))
+	user = d.get('user', d.get('song-added-by', 'Singer'))
+	if not song:
+		return 'Song is required', 400
 	rc = K.enqueue(song, user)
 	song_title = filename_from_path(song)
 	return json.dumps({"song": song_title, "success": rc})
@@ -358,176 +374,137 @@ def enqueue():
 
 @app.route("/skip")
 def skip():
-	K.skip()
+	if not K.skip():
+		return control_unavailable()
 	return ''
 
 
 @app.route("/pause")
 def pause():
-	K.pause()
+	if not K.pause():
+		return control_unavailable()
 	return json.dumps(K.is_paused)
 
 
 @app.route("/transpose/<semitones>", methods = ["GET"])
 def transpose(semitones):
-	K.play_transposed(semitones)
+	if not K.play_transposed(semitones):
+		return control_unavailable()
 	return ''
 
 
 @app.route("/play_speed/<speed>", methods = ["GET"])
 def play_speed(speed):
-	K.play_speed_set(speed)
+	if K.play_speed_set(speed) is False:
+		return control_unavailable()
 	return ''
 
 
 @app.route("/next_audio_track", methods = ["GET"])
 def next_audio_track():
-	K.next_audio_track()
+	if not K.next_audio_track():
+		return control_unavailable()
 	return ''
 
 
 @app.route("/seek/<goto_sec>", methods = ["GET"])
 def seek(goto_sec):
-	K.seek(goto_sec)
+	if not K.seek(goto_sec):
+		return control_unavailable()
 	return ''
 
 
 @app.route("/audio_delay/<delay_val>", methods = ["GET"])
 def audio_delay(delay_val):
 	res = K.set_audio_delay(delay_val)
+	if res is False:
+		return control_unavailable()
 	return json.dumps(res)
 
 
 @app.route("/subtitle_delay/<delay_val>", methods = ["GET"])
 def subtitle_delay(delay_val):
 	res = K.set_subtitle_delay(delay_val)
+	if res is False:
+		return control_unavailable()
 	return json.dumps(res)
 
 
 @app.route("/toggle_subtitle")
 def toggle_subtitle():
-	K.toggle_subtitle()
+	if not K.toggle_subtitle():
+		return control_unavailable()
 	return ''
 
 
 @app.route("/restart")
 def restart():
-	K.restart()
+	if not K.restart():
+		return control_unavailable()
 	return redirect(url_for("home"))
 
 
 @app.route("/vol_up")
 def vol_up():
-	return str(K.vol_up())
+	result = K.vol_up()
+	return control_unavailable() if result is False else str(result)
 
 
 @app.route("/vol_down")
 def vol_down():
-	return str(K.vol_down())
+	result = K.vol_down()
+	return control_unavailable() if result is False else str(result)
 
 
 @app.route("/vol/<volume>")
 def vol_set(volume):
-	return str(K.vol_set(volume))
+	result = K.vol_set(volume)
+	return control_unavailable() if result is False else str(result)
 
 
-@app.route("/browse", methods = ["GET"])
+def control_unavailable():
+	return jsonify(success=False, error='The player is busy, no song is playing, or the requested value is unavailable. Please try again.'), 409
+
+
+def render_browse(template_name, use_sort_cookie=False):
+	query = request.args.get('q', '').strip()
+	letter = None if query else request.args.get('letter', '').lower()
+	if letter != 'numeric' and (not letter or len(letter) != 1 or letter not in 'abcdefghijklmnopqrstuvwxyz'):
+		letter = None
+	page = max(1, request.args.get(get_page_parameter(), type=int, default=1))
+	sort_mode = request.args.get('sort', request.cookies.get('sort', 'alpha') if use_sort_cookie else 'alpha')
+	by_date = sort_mode == 'date'
+	# One catalog reference gives each request a consistent snapshot, even while
+	# a Refresh builds and publishes the next catalog in another thread.
+	catalog = K.song_catalog
+	songs = catalog.select(query=query, letter=letter, by_date=by_date)
+	found = len(songs)
+	results_per_page = 200
+	page = min(page, max(1, (found + results_per_page - 1) // results_per_page))
+	pagination = Pagination(
+		css_framework='bulma', page=page, total=found, found=found,
+		search=bool(query), search_msg=getString2(103), record_name=getString2(101),
+		display_msg=getString2(102), per_page=results_per_page,
+	)
+	start_index = (page - 1) * results_per_page
+	return render_template(
+		template_name, getString1=getString2, pagination=pagination,
+		query=query, results_per_page=results_per_page,
+		sort_order='Date' if by_date else 'Alphabetical',
+		sort_order_text=getString2(99 if by_date else 100), letter=letter,
+		title=getString2(98), songs=songs[start_index:start_index + results_per_page],
+	)
+
+
+@app.route("/browse", methods=["GET"])
 def browse():
-	raw_query = request.args.get('q', '')
-	query = raw_query.strip()
-	search = bool(query)
-	page = request.args.get(get_page_parameter(), type = int, default = 1)
+	return render_browse('files.html')
 
-	letter = request.args.get('letter')
-	if search:
-		letter = None
 
-	available_songs = K.available_songs
-	if letter and not search:
-		if (letter == "numeric"):
-			available_songs = [k for k,v in K.songname_trans.items() if not v[0].islower()]
-		else:
-			available_songs = [k for k,v in K.songname_trans.items() if v.startswith(letter)]
-
-	if "sort" in request.args and request.args["sort"] == "date":
-		songs = sorted(available_songs, key = lambda x: os.path.getctime(x))
-		songs.reverse()
-		sort_order = "Date"
-		sort_order_text = getString2(99)
-	else:
-		songs = available_songs
-		sort_order = "Alphabetical"
-		sort_order_text = getString2(100)
-
-	results_per_page = 200
-	if search:
-		query_fold = query.casefold()
-		songs = [song for song in songs if query_fold in filename_for_search(song).casefold()]
-	found = len(songs)
-	pagination = Pagination(css_framework = 'bulma', page = page, total = found, found = found, search = search, search_msg = getString2(103),
-	                        record_name = getString2(101), display_msg = getString2(102), per_page = results_per_page)
-	start_index = (page - 1) * results_per_page
-	return render_template(
-		"files.html",
-		getString1 = getString2,
-		pagination = pagination,
-		query = query,
-		results_per_page = results_per_page,
-		sort_order = sort_order,
-		sort_order_text = sort_order_text,
-		letter = letter,
-		title = getString2(98),
-		songs = songs[start_index:start_index + results_per_page]
-	)
-@app.route("/f_browse", methods = ["GET"])
+@app.route("/f_browse", methods=["GET"])
 def f_browse():
-	ip2pane[request.remote_addr] = 'browse'
-	raw_query = request.args.get('q', '')
-	query = raw_query.strip()
-	search = bool(query)
-	page = request.args.get(get_page_parameter(), type = int, default = 1)
+	return render_browse('f_browse.html', use_sort_cookie=True)
 
-	letter = request.args.get('letter')
-	if search:
-		letter = None
-
-	available_songs = K.available_songs
-	if letter and not search:
-		if (letter == "numeric"):
-			available_songs = [k for k,v in K.songname_trans.items() if not v[0].islower()]
-		else:
-			available_songs = [k for k,v in K.songname_trans.items() if v.startswith(letter)]
-
-	if request.cookies.get("sort") == "date":
-		songs = sorted(available_songs, key = lambda x: os.path.getctime(x))
-		songs.reverse()
-		sort_order = "Date"
-		sort_order_text = getString2(99)
-	else:
-		songs = available_songs
-		sort_order = "Alphabetical"
-		sort_order_text = getString2(100)
-
-	results_per_page = 200
-	if search:
-		query_fold = query.casefold()
-		songs = [song for song in songs if query_fold in filename_for_search(song).casefold()]
-	found = len(songs)
-	pagination = Pagination(css_framework = 'bulma', page = page, total = found, found = found, search = search, search_msg = getString2(103),
-	                        record_name = getString2(101), display_msg = getString2(102), per_page = results_per_page)
-	start_index = (page - 1) * results_per_page
-	return render_template(
-		"f_browse.html",
-		getString1 = getString2,
-		pagination = pagination,
-		query = query,
-		results_per_page = results_per_page,
-		sort_order = sort_order,
-		sort_order_text = sort_order_text,
-		letter = letter,
-		title = getString2(98),
-		songs = songs[start_index:start_index + results_per_page]
-	)
 
 @app.route("/qrcode")
 def qrcode():
@@ -639,28 +616,35 @@ def get_default_tmp_dir():
 	return '/dev/shm' if os.path.isdir('/dev/shm') else tempfile.gettempdir()
 
 def load_media_paths(base_dir):
-	config_path = os.path.join(base_dir, "media_paths.conf")
-	local_config_path = os.path.join(base_dir, "media_paths.local.conf")
-	paths = []
-	if os.path.isfile(local_config_path):
-		config_path = local_config_path
-	if not os.path.isfile(config_path):
-		return paths
-	with open(config_path, 'r', encoding='utf-8') as fp:
-		for line in fp:
-			raw = line.strip()
-			if not raw or raw.startswith('#'):
-				continue
-			if '=' in raw:
-				_, raw = raw.split('=', 1)
-			raw = raw.strip()
-			if not raw:
-				continue
-			path = os.path.expanduser(raw)
-			if not os.path.isabs(path):
-				path = os.path.abspath(os.path.join(base_dir, path))
-			paths.append(path)
-	return paths
+	base_dir = os.path.abspath(base_dir)
+	for name in ('media_paths.local.conf', 'media_paths.conf'):
+		config_path = os.path.join(base_dir, name)
+		paths = []
+		if not os.path.isfile(config_path):
+			continue
+		try:
+			with open(config_path, 'r', encoding='utf-8') as fp:
+				for line in fp:
+					raw = line.strip()
+					if not raw or raw.startswith('#'):
+						continue
+					if '=' in raw:
+						_, raw = raw.split('=', 1)
+					raw = raw.strip()
+					if not raw:
+						continue
+					path = os.path.expanduser(raw)
+					if not os.path.isabs(path):
+						path = os.path.abspath(os.path.join(base_dir, path))
+					if path not in paths:
+						paths.append(path)
+		except OSError:
+			logging.exception('Unable to read media configuration %s', config_path)
+			continue
+		if paths:
+			logging.info('Loaded %d media folders from %s', len(paths), config_path)
+			return paths
+	return []
 
 
 if __name__ == "__main__":
@@ -695,6 +679,7 @@ if __name__ == "__main__":
 	)
 	parser.add_argument(
 		"-v", "--volume",
+		type=int, choices=range(0, 513), metavar='0..512',
 		help = f"Initial player volume (default: {default_volume})",
 		default = default_volume,
 	)
@@ -741,6 +726,7 @@ if __name__ == "__main__":
 	)
 	parser.add_argument(
 		"--vlc-port",
+		type=int,
 		help = f"HTTP port for VLC remote control api (Default: {default_vlc_port})",
 		default = default_vlc_port,
 	)
@@ -766,11 +752,12 @@ if __name__ == "__main__":
 	)
 	args = parser.parse_args()
 	args.ssl = False
+	if not math.isfinite(args.splash_delay) or args.splash_delay < 0:
+		parser.error('--splash-delay must be a finite nonnegative number')
+	if not 1 <= args.port <= 65535 or not 1 <= args.vlc_port <= 65535:
+		parser.error('--port and --vlc-port must be between 1 and 65535')
 
 	set_language(args.lang)
-
-	app.jinja_env.globals.update(filename_from_path = filename_from_path)
-	app.jinja_env.globals.update(url_escape = quote)
 
 	args.tmp_dir = os.path.expanduser(args.temp or get_default_tmp_dir())
 	args.media_paths = load_media_paths(os.path.dirname(__file__))
@@ -780,6 +767,7 @@ if __name__ == "__main__":
 			media_path = os.path.abspath(os.path.join(os.path.dirname(__file__), media_path))
 		args.media_paths = [media_path]
 
+	args.vlc_path = shutil.which(args.vlc_path) or os.path.abspath(os.path.expanduser(args.vlc_path))
 	if not os.path.isfile(args.vlc_path):
 		print(getString(45) + args.vlc_path)
 		sys.exit(1)
@@ -789,9 +777,7 @@ if __name__ == "__main__":
 	if not args.media_paths:
 		args.media_paths = [default_media_dir]
 		use_default_media_dir = True
-	primary_media = os.path.expanduser(args.media_paths[0]).rstrip('/') + '/'
-	if platform == 'windows':	# on Windows, VLC cannot open filenames containing '/'
-		primary_media = escape_win_filename(primary_media)
+	primary_media = os.path.abspath(os.path.expanduser(args.media_paths[0]))
 	if not os.path.exists(primary_media):
 		if use_default_media_dir:
 			print(getString(47) + primary_media)
@@ -801,7 +787,7 @@ if __name__ == "__main__":
 	args.library_root = primary_media
 
 	# determine whether to save/load delays
-	args.dft_delays_file = args.library_root + '.delays'
+	args.dft_delays_file = os.path.join(args.library_root, '.delays')
 	if args.save_delays == 'auto':
 		args.save_delays = args.dft_delays_file if os.path.exists(args.dft_delays_file) else None
 	elif args.save_delays == 'yes':
@@ -811,10 +797,11 @@ if __name__ == "__main__":
 
 	# Configure karaoke process
 	os.K = K = Karaoke(args)
+	signal.signal(signal.SIGTERM, lambda signum, frame: K.stop())
 
 	threading.Thread(target=lambda:app.run(host='0.0.0.0', port=args.port, threaded = True)).start()
 
-	threading.Thread(target=status_thread).start()
+	threading.Thread(target=status_thread, daemon=True).start()
 
 	K.run()
 	os._exit(0)	# force-stop all flask threads and exit

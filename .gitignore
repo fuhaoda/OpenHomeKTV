@@ -9,3 +9,5 @@ songs/
 qrcode.png
 .DS_Store
 media_paths.local.conf
+.playwright-cli/
+output/playwright/

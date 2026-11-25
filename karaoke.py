@@ -3,13 +3,16 @@ import logging, socket, subprocess, threading
 import shutil
 import gzip
 import warnings
+import ast
+import math
+import re
+import tempfile
 from subprocess import check_output
 from collections import *
 from functools import wraps
 
-import numpy as np
-
-from lib.media import iter_media_files
+from lib.media import media_title
+from lib.catalog import MediaCatalog
 
 # pygame 2.5.x imports pkg_resources during startup, which emits a deprecation
 # warning under modern setuptools. Narrowly suppress that third-party warning
@@ -25,19 +28,14 @@ import qrcode
 import arabic_reshaper
 from bidi.algorithm import get_display
 from unidecode import unidecode
-from flask import request
 from lib import vlcclient
 from lib.get_platform import *
-from app import getString
 
 if get_platform() != "windows":
-	from signal import SIGALRM, alarm, signal, SIGTERM
-	signal(SIGTERM, lambda signum, stack_frame: os.K.stop())
+	from signal import SIGALRM, alarm, signal
 
-STD_VOL = 65536/8/np.sqrt(2)
-ip2websock, ip2pane = {}, {}
+from lib.events import ip2websock, ip2pane, ws_send, flash
 
-ws_send = lambda ip, msg: ip2websock[ip].send(msg) if ip in ip2websock else None
 
 def synchronized_state(method):
 	@wraps(method)
@@ -46,8 +44,19 @@ def synchronized_state(method):
 			return method(self, *args, **kwargs)
 	return wrapper
 
-def flash(message: str, category: str = "message", client_ip = ''):
-	ws_send(client_ip or request.remote_addr, f'showNotification("{message}", "{category}")')
+
+def serialized_playback(method):
+	"""Serialize player transitions without making other requests wait on VLC."""
+	@wraps(method)
+	def wrapper(self, *args, **kwargs):
+		if not self.playback_lock.acquire(blocking=False):
+			return False
+		try:
+			return method(self, *args, **kwargs)
+		finally:
+			self.playback_lock.release()
+	return wrapper
+
 
 def cleanse_modules(name):
 	try:
@@ -110,6 +119,13 @@ class Karaoke:
 		self.pending_audio_track_index = None
 		self.pending_audio_track_cli_index = None
 		self.state_lock = threading.RLock()
+		self.playback_lock = threading.RLock()
+		self.queue = []
+		self.queue_json = '[]'
+		self.available_songs = []
+		self.songname_trans = {}
+		self.event_dirty = threading.Event()
+		self.full_screen = not args.windowed
 
 		logging.basicConfig(
 			format = "[%(asctime)s] %(levelname)s: %(message)s",
@@ -325,7 +341,7 @@ class Karaoke:
 		for size in sizes:
 			if size not in self.fonts:
 				self.fonts[size] = [pygame.freetype.SysFont(pygame.freetype.get_default_font(), size)] \
-						+ [pygame.freetype.Font(f'font/{name}', size) for name in ['arial-unicode-ms.ttf', 'unifont.ttf']]
+						+ [pygame.freetype.Font(os.path.join(self.base_path, 'font', name), size) for name in ['arial-unicode-ms.ttf', 'unifont.ttf']]
 
 		# find a font that contains all characters of the song title, if cannot find, then display transliteration instead
 		found = None
@@ -357,22 +373,12 @@ class Karaoke:
 
 	def get_available_songs(self):
 		logging.info("Fetching available songs in: " + ", ".join(self.media_paths))
-		songname_trans = {}
-		ordered_files = []
-		seen_directories = set()
-		for media_dir in self.media_paths:
-			files_in_dir = []
-			for fn in iter_media_files(media_dir, seen_directories):
-				files_in_dir.append(fn)
-				trans = unidecode(self.filename_from_path(fn)).lower()
-				while trans and not trans[0].islower() and not trans[0].isdigit():
-					trans = trans[1:]
-				songname_trans[fn] = trans
-			files_in_dir.sort(key=lambda f: (songname_trans[f], f))
-			ordered_files.extend(files_in_dir)
-
-		self.songname_trans = songname_trans
-		self.available_songs = ordered_files
+		catalog = MediaCatalog(self.media_paths)
+		with getattr(self, 'state_lock', threading.RLock()):
+			self.song_catalog = catalog
+			self.songname_trans = catalog.sort_names
+			self.available_songs = list(catalog.songs)
+			self.available_song_set = catalog.song_set
 
 	def get_all_assoc_files(self, song_path):
 		song_dir = os.path.dirname(song_path)
@@ -429,194 +435,214 @@ class Karaoke:
 		self.get_available_songs()
 
 	def filename_from_path(self, file_path):
-		rc = os.path.basename(file_path)
-		rc = os.path.splitext(rc)[0]
-		rc = rc.split("---")[0]
-		return rc
+		return media_title(file_path)
 
 	def kill_player(self):
 		logging.debug("Killing old VLC processes")
 		if self.vlcclient is not None:
 			self.vlcclient.kill()
 
-	@synchronized_state
-	def play_file(self, file_path, extra_params = []):
-		self.switchingSong = True
-		is_new_media = file_path != self.now_playing_filename
-		if self.save_delays:
-			saved_delays = self.delays.get(os.path.basename(file_path), {})
-			self.audio_delay = self.audio_delay if self.audio_delay else saved_delays.get('audio_delay', 0)
-			self.subtitle_delay = self.subtitle_delay if self.subtitle_delay else saved_delays.get('subtitle_delay', 0)
-			self.show_subtitle = False if self.show_subtitle==False else saved_delays.get('show_subtitle', True)
-		if is_new_media and self.pending_audio_track_index is None and self.pending_audio_track_cli_index is None:
-			self.prepare_default_audio_track(file_path)
-		extra_params1 = []
-		logging.info("Playing video in VLC: " + file_path)
-		if self.platform != 'osx':
-			extra_params1 += ['--drawable-hwnd' if self.platform == 'windows' else '--drawable-xid',
-			                  hex(pygame.display.get_wm_info()['window'])]
-		if self.audio_delay:
-			extra_params1 += [f'--audio-desync={self.audio_delay * 1000}']
-		if self.subtitle_delay:
-			extra_params1 += [f'--sub-delay={self.subtitle_delay * 10}']
-		if self.show_subtitle:
-			extra_params1 += [f'--sub-track=0']
-		if self.pending_audio_track_cli_index is not None:
-			# VLC's --audio-track uses a 0-based ordinal, while the IDs returned by
-			# status/pl_info/ffprobe are stream IDs. Use --audio-track-id so reloads
-			# preserve the intended track reliably across containers/codecs.
-			extra_params1 += [f'--audio-track-id={self.pending_audio_track_cli_index}']
-		if self.play_speed != 1:
-			extra_params1 += [f'--rate={self.play_speed}']
-		self.now_playing = self.filename_from_path(file_path)
-		self.now_playing_filename = file_path
-		self.is_paused = ('--start-paused' in extra_params1)
-		if self.normalize_vol and self.logical_volume is not None:
-			self.volume = self.logical_volume / np.sqrt(self.get_mp3_volume(file_path))
-		if self.now_playing_transpose == 0:
-			xml = self.vlcclient.play_file(file_path, self.volume, extra_params + extra_params1)
-		else:
-			xml = self.vlcclient.play_file_transpose(file_path, self.now_playing_transpose, self.volume, extra_params + extra_params1)
-		self.has_subtitle = "<info name='Type'>Subtitle</info>" in xml
-		self.has_video = "<info name='Type'>Video</info>" in xml
-		self.volume = round(float(self.vlcclient.get_val_xml(xml, 'volume')))
-		if self.normalize_vol:
-			self.media_vol = self.get_mp3_volume(self.now_playing_filename)
-			self.logical_volume = self.volume * np.sqrt(self.media_vol)
-		self.set_default_audio_track(xml)
-		self.pending_audio_track_index = None
-		self.pending_audio_track_cli_index = None
+	@serialized_playback
+	def play_file(self, file_path, extra_params=None):
+		params = list(extra_params or [])
+		with self.state_lock:
+			self.switchingSong = True
+			is_new_media = file_path != self.now_playing_filename
+		try:
+			if is_new_media:
+				with self.state_lock:
+					self.auto_save_delays()
+					saved = self.get_saved_delays(file_path) if self.save_delays else {}
+					self.audio_delay = saved.get('audio_delay', 0)
+					self.subtitle_delay = saved.get('subtitle_delay', 0)
+					self.show_subtitle = saved.get('show_subtitle', True)
+				if self.pending_audio_track_index is None and self.pending_audio_track_cli_index is None:
+					self.prepare_default_audio_track(file_path)
+			with self.state_lock:
+				if self.platform != 'osx' and not self.hide_splash_screen:
+					window = pygame.display.get_wm_info().get('window')
+					if window:
+						params += ['--drawable-hwnd' if self.platform == 'windows' else '--drawable-xid', hex(window)]
+				if self.audio_delay:
+					params.append(f'--audio-desync={self.audio_delay * 1000}')
+				if self.subtitle_delay:
+					params.append(f'--sub-delay={self.subtitle_delay * 10}')
+				params.append('--sub-track=0' if self.show_subtitle else '--sub-track=-1')
+				if self.pending_audio_track_cli_index is not None:
+					params.append(f'--audio-track-id={self.pending_audio_track_cli_index}')
+				if self.play_speed != 1:
+					params.append(f'--rate={self.play_speed}')
+				self.now_playing = self.filename_from_path(file_path)
+				self.now_playing_filename = file_path
+				self.is_paused = '--start-paused' in params
+				volume = self.volume
+				transpose = self.now_playing_transpose
+			if self.normalize_vol:
+				media_vol = self.get_mp3_volume(file_path)
+				if self.logical_volume is not None:
+					volume = self.logical_volume / media_vol
+			else:
+				media_vol = 1.0
+			volume = min(max(round(float(volume)), 0), 512)
+			logging.info("Playing video in VLC: %s", file_path)
+			if transpose == 0:
+				xml = self.vlcclient.play_file(file_path, volume, params)
+			else:
+				xml = self.vlcclient.play_file_transpose(file_path, transpose, volume, params)
+			if not isinstance(xml, str) or not xml:
+				raise vlcclient.PlaybackError("VLC did not return playback status")
+			current_track, desired_track = self.set_default_audio_track(xml)
+			submitted_track = next((parameter.split('=', 1)[1] for parameter in params if parameter.startswith('--audio-track-id=')), None)
+			if desired_track is not None and str(submitted_track) != str(desired_track) and current_track != desired_track:
+				# When no prelaunch metadata was available, the first valid status may
+				# reveal the accompaniment track. Apply it once, rather than only
+				# updating the UI label while the original audio keeps playing.
+				params = [parameter for parameter in params if not parameter.startswith('--audio-track-id=')]
+				params.append(f'--audio-track-id={desired_track}')
+				if transpose == 0:
+					xml = self.vlcclient.play_file(file_path, volume, params)
+				else:
+					xml = self.vlcclient.play_file_transpose(file_path, transpose, volume, params)
+				if not isinstance(xml, str) or not xml:
+					raise vlcclient.PlaybackError("VLC did not return playback status")
+				self.set_default_audio_track(xml)
+			with self.state_lock:
+				self.has_subtitle = "<info name='Type'>Subtitle</info>" in xml
+				self.has_video = "<info name='Type'>Video</info>" in xml
+				actual_volume = self.vlcclient.get_val_xml(xml, 'volume')
+				try:
+					self.volume = round(float(actual_volume))
+				except (ValueError, TypeError):
+					self.volume = volume
+				self.media_vol = media_vol
+				if self.normalize_vol:
+					self.logical_volume = self.volume * media_vol
+			return True
+		except Exception:
+			with self.state_lock:
+				self.reset_now_playing()
+			self.vlcclient.kill()
+			raise
+		finally:
+			with self.state_lock:
+				self.pending_audio_track_index = None
+				self.pending_audio_track_cli_index = None
+				self.switchingSong = False
+				self.status_dirty = True
+				self.event_dirty.set()
 
-		self.switchingSong = False
-		self.status_dirty = True
-		self.render_splash_screen()  # remove old previous track
 
-	@synchronized_state
+	@serialized_playback
 	def play_transposed(self, semitones):
-		self.now_playing_transpose = semitones
-		status_xml = self.vlcclient.command().text if self.is_paused else self.vlcclient.pause(False).text
-		info = self.vlcclient.get_info_xml(status_xml)
-		posi = info['position']*info['length']
-		if self.audio_track_index and self.audio_track_index >= 1:
-			self.pending_audio_track_index = self.audio_track_index
-			self.pending_audio_track_cli_index = self._infer_audio_track_cli_index(self.audio_track_index)
-		self.play_file(self.now_playing_filename, [f'--start-time={posi}'] + (['--start-paused'] if self.is_paused else []))
+		try:
+			semitones = int(semitones)
+			if not -24 <= semitones <= 24:
+				return False
+		except (TypeError, ValueError):
+			return False
+		with self.state_lock:
+			if self.switchingSong or not self.is_file_playing():
+				return False
+			self.now_playing_transpose = semitones
+		return self.reload_current_track()
 
 	def is_file_playing(self):
-		if self.vlcclient is not None and self.vlcclient.is_running():
-			return True
-		elif self.now_playing_filename:
-			self.now_playing = self.now_playing_filename = None
-		return False
+		return self.vlcclient is not None and self.vlcclient.is_running()
 
 	def is_song_in_queue(self, song_path):
 		return song_path in map(lambda t: t['file'], self.queue)
 
 	@synchronized_state
-	def enqueue(self, song_path, user = "Pikaraoke"):
-		if (self.is_song_in_queue(song_path)):
-			logging.warn("Song is already in queue, will not add: " + song_path)
+	def enqueue(self, song_path, user="Pikaraoke"):
+		catalog = getattr(self, 'available_song_set', self.available_songs)
+		if not isinstance(song_path, str) or song_path not in catalog:
+			logging.warning("Ignoring song outside the current catalog: %r", song_path)
 			return False
-		else:
-			logging.info("'%s' is adding song to queue: %s" % (user, song_path))
-			self.queue.append({"user": user, "file": song_path, "title": self.filename_from_path(song_path)})
-			self.update_queue()
-			return True
+		if self.is_song_in_queue(song_path):
+			logging.info("Song is already in queue: %s", song_path)
+			return False
+		self.queue.append({"user": str(user), "file": song_path, "title": self.filename_from_path(song_path)})
+		self.update_queue()
+		return True
+
 
 	@synchronized_state
 	def queue_add_random(self, amount):
-		logging.info("Adding %d random songs to queue" % amount)
-		songs = list(self.available_songs)  # make a copy
-		if len(songs) == 0:
-			logging.warn("No available songs!")
+		try:
+			amount = int(amount)
+		except (TypeError, ValueError):
 			return False
-		i = 0
-		while i < amount:
-			r = random.randint(0, len(songs) - 1)
-			if self.is_song_in_queue(songs[r]):
-				logging.warn("Song already in queue, trying another... " + songs[r])
-			else:
-				self.queue.append({"user": "Random", "file": songs[r], "title": self.filename_from_path(songs[r])})
-				i += 1
-			songs.pop(r)
-			if len(songs) == 0:
-				self.update_queue()
-				logging.warn("Ran out of songs!")
-				return False
-		self.update_queue()
-		return True
+		if amount <= 0:
+			return False
+		queued = {song['file'] for song in self.queue}
+		candidates = [song for song in self.available_songs if song not in queued]
+		selected = random.sample(candidates, min(amount, len(candidates)))
+		for song in selected:
+			self.queue.append({"user": "Random", "file": song, "title": self.filename_from_path(song)})
+		if selected:
+			self.update_queue()
+		return len(selected) == amount
 
 	@synchronized_state
 	def update_queue(self):
 		self.queue_json = json.dumps(self.queue)
 		self.status_dirty = True
+		self.event_dirty.set()
 
-	@synchronized_state
+
 	def queue_clear(self):
-		logging.info("Clearing queue!")
-		self.queue = []
-		self.update_queue()
-		if self.is_file_playing():
-			self.skip()
+		with self.state_lock:
+			playing_or_starting = self.switchingSong or self.is_file_playing()
+			self.queue = []
+			self.update_queue()
+		return self.skip() if playing_or_starting else True
+
 
 	@synchronized_state
 	def queue_edit(self, song_file, action, **kwargs):
 		if action == "move":
 			try:
-				src, tgt, size = [int(kwargs[n]) for n in ['src', 'tgt', 'size']]
-				if size > len(self.queue):
-					# new songs have started while dragging the list
-					diff = size - len(self.queue)
-					src -= diff
-					tgt -= diff
-				song = self.queue.pop(src)
-				self.queue.insert(tgt, song)
-			except:
-				logging.error("Invalid move song request: " + str(kwargs))
+				src, tgt, size = (int(kwargs[name]) for name in ('src', 'tgt', 'size'))
+			except (ValueError, TypeError, KeyError):
 				return False
+			if size != len(self.queue) or not (0 <= src < size and 0 <= tgt < size):
+				logging.info("Ignoring stale or invalid queue move: %s", kwargs)
+				return False
+			self.queue.insert(tgt, self.queue.pop(src))
 		else:
-			match = [(ii,each) for ii,each in enumerate(self.queue) if song_file in each["file"]]
-			index, song = match[0] if match else (-1, None)
-			if song == None:
-				logging.warning("Song not found in queue: %s", song_file)
+			index = next((i for i, item in enumerate(self.queue) if item['file'] == song_file), None)
+			if index is None:
 				return False
-			if action == "up":
-				if index < 1:
-					logging.warn("Song is up next, can't bump up in queue: " + song["file"])
-					return False
-				else:
-					logging.info("Bumping song up in queue: " + song["file"])
-					del self.queue[index]
-					self.queue.insert(index - 1, song)
-			elif action == "down":
-				if index == len(self.queue) - 1:
-					logging.warn("Song is already last, can't bump down in queue: " + song["file"])
-					return False
-				else:
-					logging.info("Bumping song down in queue: " + song["file"])
-					del self.queue[index]
-					self.queue.insert(index + 1, song)
-			elif action == "delete":
-				logging.info("Deleting song from queue: " + song["file"])
+			if action == 'delete':
 				del self.queue[index]
+			elif action == 'up' and index > 0:
+				self.queue.insert(index - 1, self.queue.pop(index))
+			elif action == 'down' and index + 1 < len(self.queue):
+				self.queue.insert(index + 1, self.queue.pop(index))
 			else:
-				logging.error("Unrecognized direction: " + action)
 				return False
 		self.update_queue()
 		return True
 
-	@synchronized_state
-	def skip(self):
-		if self.is_file_playing():
-			logging.info("Skipping: " + self.now_playing)
-			self.vlcclient.stop()
-			self.reset_now_playing()
-			return True
-		logging.warning("Tried to skip, but no file is playing!")
-		return False
 
+	@serialized_playback
+	def skip(self):
+		with self.state_lock:
+			if self.switchingSong or not self.is_file_playing():
+				return False
+		self.vlcclient.stop()
+		with self.state_lock:
+			self.reset_now_playing()
+			self.status_dirty = True
+			self.event_dirty.set()
+		return True
+
+
+	@serialized_playback
 	@synchronized_state
 	def seek(self, seek_sec):
+		if self.switchingSong:
+			return False
 		if self.is_file_playing():
 			self.vlcclient.seek(seek_sec)
 			self.enforce_audio_track()
@@ -624,139 +650,159 @@ class Karaoke:
 		logging.warning("Tried to seek, but no file is playing!")
 		return False
 
+	def delay_key(self, filename):
+		return os.path.normcase(os.path.realpath(filename))
+
+	def get_saved_delays(self, filename):
+		key = self.delay_key(filename)
+		if key in self.delays:
+			return dict(self.delays[key])
+		return dict(self.delays.get(os.path.basename(filename), {}))
+
 	def set_delays_dict(self, filename, key, val, dft_val=0):
-		basename = os.path.basename(filename)
-		delays = self.delays.get(basename, {})
+		if not filename:
+			return
+		path_key = self.delay_key(filename)
+		delays = self.get_saved_delays(filename)
 		if val == dft_val:
 			delays.pop(key, None)
 		else:
 			delays[key] = val
-		if delays:
-			self.delays[basename] = delays
-		else:
-			self.delays.pop(basename, {})
+		# An empty entry explicitly overrides an inherited legacy basename entry.
+		self.delays[path_key] = delays
 		self.delays_dirty = True
 
+	@serialized_playback
 	@synchronized_state
 	def set_audio_delay(self, delay):
-		if delay == '+':
-			self.audio_delay += 0.1
-		elif delay == '-':
-			self.audio_delay -= 0.1
-		elif delay == '':
-			self.audio_delay = 0
-		else:
-			try:
-				self.audio_delay = float(delay)
-			except:
-				logging.warning(f"Tried to set audio delay to an invalid value {delay}, ignored!")
+		if self.switchingSong or not self.is_file_playing():
+			return False
+		try:
+			value = self.audio_delay + 0.1 if delay == '+' else self.audio_delay - 0.1 if delay == '-' else 0 if delay == '' else float(delay)
+			if not math.isfinite(value):
 				return False
-
+		except (TypeError, ValueError):
+			return False
+		self.audio_delay = value
 		if self.save_delays:
-			self.set_delays_dict(self.now_playing_filename, 'audio_delay', self.audio_delay)
+			self.set_delays_dict(self.now_playing_filename, 'audio_delay', value)
+		self.vlcclient.command(f'audiodelay&val={value}')
+		self.status_dirty = True
+		return value
 
-		if self.is_file_playing():
-			self.vlcclient.command(f"audiodelay&val={self.audio_delay}")
-			self.status_dirty = True
-			return self.audio_delay
-		logging.warning("Tried to set audio delay, but no file is playing!")
-		return False
-
+	@serialized_playback
 	@synchronized_state
 	def set_subtitle_delay(self, delay):
-		if delay == '+':
-			self.subtitle_delay += 0.1
-		elif delay == '-':
-			self.subtitle_delay -= 0.1
-		elif delay == '':
-			self.subtitle_delay = 0
-		else:
-			try:
-				self.subtitle_delay = float(delay)
-			except:
-				logging.warning(f"Tried to set subtitle delay to an invalid value {delay}, ignored!")
+		if self.switchingSong or not self.is_file_playing():
+			return False
+		try:
+			value = self.subtitle_delay + 0.1 if delay == '+' else self.subtitle_delay - 0.1 if delay == '-' else 0 if delay == '' else float(delay)
+			if not math.isfinite(value):
 				return False
-
+		except (TypeError, ValueError):
+			return False
+		self.subtitle_delay = value
 		if self.save_delays:
-			self.set_delays_dict(self.now_playing_filename, 'subtitle_delay', self.subtitle_delay)
+			self.set_delays_dict(self.now_playing_filename, 'subtitle_delay', value)
+		self.vlcclient.command(f'subdelay&val={value}')
+		self.status_dirty = True
+		return value
 
-		if self.is_file_playing():
-			self.vlcclient.command(f"subdelay&val={self.subtitle_delay}")
-			self.status_dirty = True
-			return self.subtitle_delay
-		logging.warning("Tried to set subtitle delay, but no file is playing!")
-		return False
-
-	@synchronized_state
+	@serialized_playback
 	def toggle_subtitle(self):
-		self.show_subtitle = not self.show_subtitle
-		if self.save_delays:
-			self.set_delays_dict(self.now_playing_filename, 'show_subtitle', self.show_subtitle, True)
-		self.reload_current_track()
+		with self.state_lock:
+			if self.switchingSong or not self.is_file_playing():
+				return False
+			self.show_subtitle = not self.show_subtitle
+			if self.save_delays:
+				self.set_delays_dict(self.now_playing_filename, 'show_subtitle', self.show_subtitle, True)
+		return self.reload_current_track()
 
+	@serialized_playback
 	@synchronized_state
 	def pause(self):
-		if self.is_file_playing():
-			logging.info("Toggling pause: " + self.now_playing)
-			if self.vlcclient.is_playing():
-				self.vlcclient.pause()
-				self.is_paused = True
-			else:
-				self.vlcclient.play()
-				self.is_paused = False
-			self.status_dirty = True
-			return True
-		else:
-			logging.warning("Tried to pause, but no file is playing!")
+		if self.switchingSong or not self.is_file_playing():
 			return False
+		response = self.vlcclient.play() if self.is_paused else self.vlcclient.pause()
+		if getattr(response, 'status_code', 200) != 200:
+			return False
+		self.is_paused = not self.is_paused
+		self.status_dirty = True
+		return True
 
+	def read_player_number(self, xml, name):
+		try:
+			value = float(self.vlcclient.get_val_xml(xml, name))
+			return value if math.isfinite(value) else None
+		except (ValueError, TypeError):
+			return None
+
+	@serialized_playback
 	@synchronized_state
 	def vol_up(self):
-		if self.is_file_playing():
-			self.vlcclient.vol_up()
-			xml = self.vlcclient.command().text
-			self.volume = int(self.vlcclient.get_val_xml(xml, 'volume'))
-			self.update_logical_vol()
-			return self.volume
-		else:
-			logging.warning("Tried to volume up, but no file is playing!")
+		if self.switchingSong or not self.is_file_playing():
 			return False
+		response = self.vlcclient.vol_up()
+		value = self.read_player_number(response.text, 'volume')
+		if getattr(response, 'status_code', 200) != 200 or value is None:
+			return False
+		self.volume = round(value)
+		self.update_logical_vol()
+		self.status_dirty = True
+		return self.volume
 
+	@serialized_playback
 	@synchronized_state
 	def vol_down(self):
-		if self.is_file_playing():
-			self.vlcclient.vol_down()
-			xml = self.vlcclient.command().text
-			self.volume = int(self.vlcclient.get_val_xml(xml, 'volume'))
-			self.update_logical_vol()
-			return self.volume
-		else:
-			logging.warning("Tried to volume down, but no file is playing!")
+		if self.switchingSong or not self.is_file_playing():
 			return False
+		response = self.vlcclient.vol_down()
+		value = self.read_player_number(response.text, 'volume')
+		if getattr(response, 'status_code', 200) != 200 or value is None:
+			return False
+		self.volume = round(value)
+		self.update_logical_vol()
+		self.status_dirty = True
+		return self.volume
 
+	@serialized_playback
 	@synchronized_state
 	def vol_set(self, volume):
-		if self.is_file_playing():
-			self.vlcclient.vol_set(volume)
-			xml = self.vlcclient.command().text
-			self.volume = int(self.vlcclient.get_val_xml(xml, 'volume'))
-			self.update_logical_vol()
-			return self.volume
-		else:
-			logging.warning("Tried to set volume, but no file is playing!")
+		if self.switchingSong or not self.is_file_playing():
 			return False
+		try:
+			volume = float(volume)
+			if not math.isfinite(volume) or not 0 <= volume <= 512:
+				return False
+		except (TypeError, ValueError):
+			return False
+		response = self.vlcclient.vol_set(round(volume))
+		value = self.read_player_number(response.text, 'volume')
+		if getattr(response, 'status_code', 200) != 200 or value is None:
+			return False
+		self.volume = round(value)
+		self.update_logical_vol()
+		self.status_dirty = True
+		return self.volume
 
+	@serialized_playback
 	@synchronized_state
 	def play_speed_set(self, speed):
-		if self.is_file_playing():
-			self.vlcclient.playspeed_set(speed)
-			xml = self.vlcclient.command().text
-			self.play_speed = float(self.vlcclient.get_val_xml(xml, 'rate'))
-			logging.info(f"Playback speed set to {self.play_speed}")
-			return self.play_speed
-		else:
-			logging.warning("Tried to set play speed, but no file is playing!")
+		if self.switchingSong or not self.is_file_playing():
 			return False
+		try:
+			speed = float(speed)
+			if not math.isfinite(speed) or not 0.25 <= speed <= 4:
+				return False
+		except (TypeError, ValueError):
+			return False
+		response = self.vlcclient.playspeed_set(speed)
+		value = self.read_player_number(response.text, 'rate')
+		if getattr(response, 'status_code', 200) != 200 or value is None:
+			return False
+		self.play_speed = value
+		self.status_dirty = True
+		return self.play_speed
 
 	def _infer_audio_track_cli_index(self, desired_index):
 		if not self.is_file_playing():
@@ -774,79 +820,68 @@ class Karaoke:
 			return 2
 		return 1
 
-	@synchronized_state
 	def prepare_default_audio_track(self, file_path):
 		_, track_ids, _ = self.vlcclient.get_audio_track_info(file_path=file_path)
 		if not track_ids:
 			return
 		desired_index = self._get_default_audio_track_index(track_ids)
-		self.audio_track_total = len(track_ids)
-		self.audio_track_index = desired_index
-		if desired_index > 1:
-			self.pending_audio_track_index = desired_index
-			self.pending_audio_track_cli_index = self._get_audio_track_id(track_ids, desired_index)
+		with self.state_lock:
+			self.audio_track_total = len(track_ids)
+			self.audio_track_index = desired_index
+			if desired_index > 1:
+				self.pending_audio_track_index = desired_index
+				self.pending_audio_track_cli_index = self._get_audio_track_id(track_ids, desired_index)
 
-	@synchronized_state
 	def update_audio_track_status(self, xml=None):
-		prev_index = self.audio_track_index
-		if not self.is_file_playing():
-			self.audio_track_index = 1
-			self.audio_track_total = 1
-			self.audio_track_source = "unknown"
-			return
-		current_id, track_ids, source = self.vlcclient.get_audio_track_info(xml, self.now_playing_filename)
-		new_index = 1
-		new_total = 1
-		if track_ids:
-			new_total = len(track_ids)
+		with self.state_lock:
+			if self.switchingSong:
+				return
+			if not self.is_file_playing():
+				self.audio_track_index = self.audio_track_total = 1
+				self.audio_track_source = 'unknown'
+				return
+			file_path = self.now_playing_filename
+			prev_index = self.audio_track_index
+			generation = getattr(self.vlcclient, 'playback_generation', None)
+		current_id, track_ids, source = self.vlcclient.get_audio_track_info(xml, file_path)
+		with self.state_lock:
+			if source == 'stale' or self.switchingSong or self.now_playing_filename != file_path or generation != getattr(self.vlcclient, 'playback_generation', None):
+				return
+			new_total = len(track_ids) or 1
 			try:
 				new_index = track_ids.index(current_id) + 1
 			except ValueError:
-				if 1 <= prev_index <= new_total:
-					new_index = prev_index
-				else:
-					new_index = self._get_default_audio_track_index(track_ids)
-		self.audio_track_index = new_index
-		self.audio_track_total = new_total
-		self.audio_track_source = source or "unknown"
+				new_index = prev_index if 1 <= prev_index <= new_total else self._get_default_audio_track_index(track_ids)
+			self.audio_track_index = new_index
+			self.audio_track_total = new_total
+			self.audio_track_source = source or 'unknown'
 
-	@synchronized_state
 	def set_default_audio_track(self, xml=None):
-		_, track_ids, source = self.vlcclient.get_audio_track_info(xml, self.now_playing_filename)
-		self.audio_track_source = source or "unknown"
-		desired_index = self.pending_audio_track_index
-		if desired_index is None:
-			desired_index = self._get_default_audio_track_index(track_ids)
-		if not track_ids:
-			self.update_audio_track_status(xml)
-			return
+		current_id, track_ids, source = self.vlcclient.get_audio_track_info(xml, self.now_playing_filename)
+		with self.state_lock:
+			self.audio_track_source = source or 'unknown'
+			desired_index = self.pending_audio_track_index
+			if desired_index is None:
+				desired_index = self._get_default_audio_track_index(track_ids)
+			self.audio_track_total = len(track_ids) or 1
+			self.audio_track_index = min(max(desired_index, 1), self.audio_track_total)
+			self.status_dirty = True
+			return current_id, self._get_audio_track_id(track_ids, self.audio_track_index) if track_ids else None
 
-		desired_index = min(max(desired_index, 1), len(track_ids))
-		# On macOS/VLC the HTTP status often omits the active audio track entirely.
-		# Keep the app's selected track as the source of truth and let reloads choose
-		# the stream via --audio-track-id, rather than mixing in HTTP audio_track calls.
-		self.audio_track_total = len(track_ids)
-		self.audio_track_index = desired_index
-		self.status_dirty = True
-
-	@synchronized_state
+	@serialized_playback
 	def next_audio_track(self):
-		if not self.is_file_playing():
+		with self.state_lock:
+			if self.switchingSong or not self.is_file_playing():
+				return False
+			file_path = self.now_playing_filename
+		_, track_ids, source = self.vlcclient.get_audio_track_info(file_path=file_path)
+		if len(track_ids) <= 1:
 			return False
-		_, track_ids, source = self.vlcclient.get_audio_track_info(file_path=self.now_playing_filename)
-		if not track_ids or len(track_ids) == 1:
-			self.update_audio_track_status()
-			return False
-		current_index = self.audio_track_index if 1 <= self.audio_track_index <= len(track_ids) else self._get_default_audio_track_index(track_ids)
-		next_index = (current_index % len(track_ids)) + 1
-		self.audio_track_source = source or "unknown"
-		self.pending_audio_track_index = next_index
-		self.pending_audio_track_cli_index = self._get_audio_track_id(track_ids, next_index)
-		self.reload_current_track(audio_track_index=next_index)
-		self.audio_track_index = next_index
-		self.audio_track_total = len(track_ids)
-		self.status_dirty = True
-		return True
+		with self.state_lock:
+			current_index = self.audio_track_index if 1 <= self.audio_track_index <= len(track_ids) else self._get_default_audio_track_index(track_ids)
+			next_index = (current_index % len(track_ids)) + 1
+			self.audio_track_source = source or 'unknown'
+		return self.reload_current_track(audio_track_index=next_index)
 
 	@synchronized_state
 	def enforce_audio_track(self):
@@ -856,37 +891,61 @@ class Karaoke:
 			return
 		self.update_audio_track_status()
 
-	@synchronized_state
+	@serialized_playback
 	def reload_current_track(self, audio_track_index=None):
-		if not self.is_file_playing():
-			logging.warning("Tried to reload, but no file is playing!")
-			return False
-		status_xml = self.vlcclient.command().text if self.is_paused else self.vlcclient.pause(False).text
+		with self.state_lock:
+			if self.switchingSong or not self.is_file_playing():
+				return False
+			file_path = self.now_playing_filename
+			was_paused = self.is_paused
+			if audio_track_index is None:
+				audio_track_index = self.audio_track_index
+		status_xml = self.vlcclient.command().text
 		info = self.vlcclient.get_info_xml(status_xml)
-		posi = info['position']*info['length']
-		if audio_track_index is None:
-			audio_track_index = self.audio_track_index
+		try:
+			position = max(0.0, float(info.get('time') or 0))
+		except (ValueError, TypeError):
+			position = 0.0
 		if audio_track_index and audio_track_index >= 1:
-			self.pending_audio_track_index = audio_track_index
-			self.pending_audio_track_cli_index = self._infer_audio_track_cli_index(audio_track_index)
-		self.play_file(self.now_playing_filename, [f'--start-time={posi}'] + (['--start-paused'] if self.is_paused else []))
-		self.update_audio_track_status()
-		return True
+			track_id = self._infer_audio_track_cli_index(audio_track_index)
+			with self.state_lock:
+				self.pending_audio_track_index = audio_track_index
+				self.pending_audio_track_cli_index = track_id
+		params = [f'--start-time={position}']
+		if was_paused:
+			params.append('--start-paused')
+		return self.play_file(file_path, params)
 
-	@synchronized_state
 	def get_state(self):
-		if self.vlcclient.is_transposing:
-			return defaultdict(lambda: None, self.player_state)
-		if not self.is_file_playing():
-			self.player_state['now_playing'] = None
-			return defaultdict(lambda: None, self.player_state)
+		def snapshot(include_cached=True):
+			defaults = {'volume': self.volume, 'time': 0, 'length': 0, 'audiodelay': self.audio_delay,
+				'subtitledelay': self.subtitle_delay, 'rate': self.play_speed, 'state': 'paused'}
+			if include_cached:
+				defaults.update(self.player_state)
+			return defaultdict(lambda: None, defaults)
+		with self.state_lock:
+			if self.switchingSong or self.vlcclient is None or self.vlcclient.is_transposing:
+				return snapshot()
+			if not self.is_file_playing():
+				return snapshot(include_cached=False)
+			file_path = self.now_playing_filename
+			generation = getattr(self.vlcclient, 'playback_generation', None)
 		new_state = self.vlcclient.get_info_xml()
-		self.player_state.update(new_state)
+		with self.state_lock:
+			if self.switchingSong or self.now_playing_filename != file_path or generation != getattr(self.vlcclient, 'playback_generation', None):
+				return snapshot()
 		self.update_audio_track_status()
-		return defaultdict(lambda: None, self.player_state)
+		with self.state_lock:
+			if not self.switchingSong and self.now_playing_filename == file_path and generation == getattr(self.vlcclient, 'playback_generation', None):
+				self.player_state.update({key: value for key, value in new_state.items() if value is not None})
+			return snapshot()
 
+
+	@serialized_playback
 	@synchronized_state
 	def restart(self):
+		if self.switchingSong:
+			return False
 		if self.is_file_playing():
 			self.vlcclient.restart()
 			self.is_paused = False
@@ -899,6 +958,9 @@ class Karaoke:
 		self.running = False
 
 	def handle_run_loop(self):
+		if self.hide_splash_screen:
+			time.sleep(0.1)
+			return
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				logging.warn("Window closed: Exiting pikaraoke...")
@@ -940,29 +1002,46 @@ class Karaoke:
 		self.audio_track_total = 1
 		self.audio_track_source = "unknown"
 		self.play_speed = 1
+		self.player_state = {}
+		self.pending_audio_track_index = None
+		self.pending_audio_track_cli_index = None
 
 	def get_mp3_volume(self, filename):
+		"""Estimate relative loudness on demand, without hashing or loading PCM."""
 		try:
-			basename, md5, fsize = os.path.basename(filename), md5sum(filename), os.stat(filename).st_size
-			vol_fsize_md5 = self.song2vol.get(basename, [0]*3)
-			if fsize == vol_fsize_md5[1] and md5 == vol_fsize_md5[2]:
-				return vol_fsize_md5[0]
-			pcm_data = subprocess.check_output(['ffmpeg', '-i', filename, '-vn', '-f', 's16le', '-acodec', 'pcm_s16le', '-'], stderr = subprocess.DEVNULL)
-			volume_val = np.clip(np.sqrt(np.std(np.frombuffer(pcm_data, dtype = np.int16))/STD_VOL), 1/16, 16)
-			self.song2vol[basename] = [volume_val, fsize, md5]
-			cache_path = os.path.join(self.library_root, '.mp3_volume.json.gz')
-			with gzip.open(cache_path, 'wt', encoding='utf-8') as fp:
-				json.dump(self.song2vol, fp, indent=1)
-			return volume_val
-		except:
-			self.normalize_vol = False
-			return 1
+			path_key = self.delay_key(filename)
+			stat = os.stat(filename)
+			cached = self.song2vol.get(path_key, {})
+			if isinstance(cached, dict) and cached.get('size') == stat.st_size and cached.get('mtime_ns') == stat.st_mtime_ns:
+				factor = float(cached['factor'])
+				if math.isfinite(factor) and factor > 0:
+					return factor
+			result = subprocess.run(
+				['ffmpeg', '-hide_banner', '-nostats', '-i', filename, '-t', '60', '-vn', '-sn', '-dn',
+				 '-af', 'volumedetect', '-f', 'null', '-'],
+				capture_output=True, text=True, timeout=45, check=True,
+			)
+			match = re.search(r'mean_volume:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB', result.stderr)
+			if not match:
+				raise ValueError('FFmpeg returned no mean volume')
+			mean_db = float(match.group(1))
+			factor = min(max(10 ** ((mean_db + 18) / 20), 1 / 16), 16)
+			self.song2vol[path_key] = {'factor': factor, 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+			try:
+				self.write_json_atomic(os.path.join(self.library_root, '.mp3_volume.json.gz'), self.song2vol, compressed=True)
+			except OSError as exc:
+				logging.warning('Could not save loudness cache: %s', exc)
+			return factor
+		except (OSError, ValueError, KeyError, TypeError, OverflowError, subprocess.SubprocessError) as exc:
+			logging.warning('Could not measure loudness for %s: %s', filename, exc)
+			return 1.0
 
 	def load_volume_cache(self):
 		cache_path = os.path.join(self.library_root, '.mp3_volume.json.gz')
 		try:
 			with gzip.open(cache_path, 'rt', encoding='utf-8') as fp:
-				return json.load(fp)
+				cache = json.load(fp)
+				return cache if isinstance(cache, dict) else {}
 		except FileNotFoundError:
 			return {}
 		except Exception:
@@ -972,73 +1051,136 @@ class Karaoke:
 		if hasattr(self, 'media_vol'):
 			self.logical_volume = self.volume * self.media_vol
 
+	@serialized_playback
 	def enable_vol_norm(self, enable):
-		self.normalize_vol = enable
 		if enable and shutil.which('ffmpeg') is None:
-			self.normalize_vol = enable = False
-		if enable and self.now_playing_filename:
-			self.volume = self.vlcclient.get_info_xml()['volume']
-			self.media_vol = self.get_mp3_volume(self.now_playing_filename)
-			self.update_logical_vol()
+			logging.warning('Volume normalization requires ffmpeg on PATH')
+			enable = False
+		with self.state_lock:
+			self.normalize_vol = bool(enable)
+			file_path = self.now_playing_filename
+		if enable and file_path:
+			factor = self.get_mp3_volume(file_path)
+			with self.state_lock:
+				self.media_vol = factor
+				self.update_logical_vol()
+		with self.state_lock:
+			self.status_dirty = True
 		return str(self.logical_volume)
 
 	def init_save_delays(self):
 		self.delays_dirty = False
+		self.delays = {}
 		try:
-			self.delays = eval(open(self.save_delays).read())
-		except:
-			self.delays = {}
-			with open(self.save_delays, 'w') as fp:
-				fp.write(str(self.delays))
+			with open(self.save_delays, encoding='utf-8') as stream:
+				content = stream.read()
+			try:
+				data = json.loads(content)
+			except json.JSONDecodeError:
+				data = ast.literal_eval(content)
+			if not isinstance(data, dict):
+				raise ValueError('Delay settings must be an object')
+			for path, settings in data.items():
+				if not isinstance(path, str) or not isinstance(settings, dict):
+					continue
+				valid = {}
+				for key in ('audio_delay', 'subtitle_delay'):
+					try:
+						value = float(settings[key])
+						if math.isfinite(value):
+							valid[key] = value
+					except (KeyError, TypeError, ValueError):
+						pass
+				if isinstance(settings.get('show_subtitle'), bool):
+					valid['show_subtitle'] = settings['show_subtitle']
+				self.delays[path] = valid
+		except FileNotFoundError:
+			self.delays_dirty = True
+			self.auto_save_delays()
+		except (OSError, ValueError, SyntaxError) as exc:
+			logging.warning('Could not load delay settings %s: %s', self.save_delays, exc)
 
+	@synchronized_state
 	def set_save_delays(self, state):
 		if state != bool(self.save_delays):
 			if state:
 				self.save_delays = self.dft_delays_file
 				self.init_save_delays()
 			else:
+				self.auto_save_delays()
 				self.save_delays = None
-				self.delete_if_exist(self.dft_delays_file)
+
+	def write_json_atomic(self, filename, data, compressed=False):
+		directory = os.path.dirname(os.path.abspath(filename))
+		descriptor, temporary = tempfile.mkstemp(prefix='.ktv-settings-', dir=directory)
+		os.close(descriptor)
+		try:
+			if compressed:
+				stream = gzip.open(temporary, 'wt', encoding='utf-8')
+			else:
+				stream = open(temporary, 'w', encoding='utf-8')
+			with stream:
+				json.dump(data, stream, ensure_ascii=False, indent=1)
+			os.replace(temporary, filename)
+		finally:
+			if os.path.exists(temporary):
+				os.remove(temporary)
 
 	def auto_save_delays(self):
 		if self.save_delays and self.delays_dirty:
-			self.delays_dirty = False
-			with open(self.save_delays, 'w') as fp:
-				fp.write(str(self.delays))
+			try:
+				self.write_json_atomic(self.save_delays, self.delays)
+				self.delays_dirty = False
+			except OSError as exc:
+				logging.warning('Could not save delay settings %s: %s', self.save_delays, exc)
 
 	def run(self):
 		logging.info("Starting PiKaraoke!")
 		self.running = True
-
-		while self.running:
-			try:
-				if not self.is_file_playing() and self.now_playing != None:
-					self.reset_now_playing()
-				if self.queue:
-					if not self.is_file_playing():
-						self.reset_now_playing()
+		try:
+			while self.running:
+				try:
+					with self.state_lock:
+						transitioning = self.switchingSong
+						playing = self.is_file_playing()
+						if not transitioning and not playing and self.now_playing is not None:
+							self.reset_now_playing()
+						start_next = bool(self.queue) and not transitioning and not playing
+					if start_next:
 						self.render_splash_screen()
-						tm = time.time()
-						while time.time()-tm < self.splash_delay:
+						deadline = time.monotonic() + self.splash_delay
+						while self.running and time.monotonic() < deadline:
 							self.handle_run_loop()
+						if not self.running:
+							break
 						with self.state_lock:
 							head = self.queue.pop(0) if self.queue else None
+							self.update_queue()
 						if head is None:
 							continue
-						self.play_file(head['file'])
-						if not self.firstSongStarted:
-							self.firstSongStarted = True
-						self.now_playing_user = head["user"]
-						self.update_queue()
-				self.handle_run_loop()
-			except KeyboardInterrupt:
-				logging.warn("Keyboard interrupt: Exiting pikaraoke...")
-				self.running = False
-
-		# Clean up before quit
-		if self.vlcclient is not None:
-			self.vlcclient.stop()
-		self.auto_save_delays()
-		time.sleep(1)
-		if self.vlcclient is not None:
-			self.vlcclient.kill()
+						try:
+							started = self.play_file(head['file'])
+						except Exception:
+							logging.exception('Skipping song after playback failure: %s', head['file'])
+							continue
+						if not started:
+							with self.state_lock:
+								self.queue.insert(0, head)
+								self.update_queue()
+							self.handle_run_loop()
+							continue
+						if started:
+							with self.state_lock:
+								self.firstSongStarted = True
+								self.now_playing_user = head['user']
+								self.update_queue()
+					self.handle_run_loop()
+				except KeyboardInterrupt:
+					self.running = False
+		finally:
+			if self.vlcclient is not None:
+				try:
+					self.vlcclient.stop()
+				finally:
+					self.vlcclient.kill()
+			self.auto_save_delays()

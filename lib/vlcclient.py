@@ -1,13 +1,16 @@
 import os, sys, re, random, shutil
-import string, logging, time
-import subprocess, zipfile
+import string, logging, time, math
+import subprocess, zipfile, threading
 import xml.etree.ElementTree as ET
 
 import requests
 
 from lib.get_platform import *
 from types import SimpleNamespace
-from html import unescape
+
+
+class PlaybackError(RuntimeError):
+	"""VLC could not start the requested media within its startup deadline."""
 
 def get_default_vlc_path(platform):
 	shutil_path = shutil.which('cvlc') or shutil.which('vlc')
@@ -28,6 +31,11 @@ def get_default_vlc_path(platform):
 
 class VLCClient:
 	vol_increment = 10
+	startup_timeout = 15.0
+	probe_timeout = 5.0
+	probe_retry_interval = 30.0
+	request_timeout = 0.5
+	status_interval = 1.0
 
 	def __init__(self, port = 5002, path = None, qrcode = None, url = None):
 
@@ -90,13 +98,17 @@ class VLCClient:
 		if self.qrcode and self.url:
 			self.cmd_base += self.get_marquee_cmd()
 
-		logging.info("VLC command base: " + " ".join(self.cmd_base))
+		logging.debug("VLC executable: %s", self.path)
 
 		self.volume_offset = 10
 		self.process = None
 		self.last_status_text = ""
-		self.last_status_time = time.time()
+		self.last_status_time = 0.0
+		self.current_file_path = None
+		self._status_lock = threading.RLock()
+		self.playback_generation = 0
 		self.audio_track_cache = {}
+		self._audio_probe_failed_at = {}
 
 	def get_marquee_cmd(self):
 		return ["--sub-source", 'logo{file=%s,position=9,x=2,opacity=200}:marq{marquee="Pikaraoke - connect at: \n%s",position=9,x=38,color=0xFFFFFF,size=11,opacity=200}' % (self.qrcode, self.url)]
@@ -133,59 +145,138 @@ class VLCClient:
 		else:
 			return file_path
 
-	def play_file(self, file_path, volume, params = []):
+	def _process_running(self):
+		return self.process is not None and self.process.poll() is None
+
+	def _playback_token(self):
+		with self._status_lock:
+			return (getattr(self, 'playback_generation', 0), self.process, getattr(self, 'current_file_path', None))
+
+	def _same_playback(self, token):
+		current = self._playback_token()
+		return current[0] == token[0] and current[1] is token[1] and current[2] == token[2]
+
+	@staticmethod
+	def _media_key(file_path):
+		return os.path.normcase(os.path.abspath(os.fspath(file_path))) if file_path else None
+
+	@staticmethod
+	def _has_media(xml):
+		try:
+			root = ET.fromstring(xml)
+		except (ET.ParseError, TypeError, ValueError):
+			return False
+		return any(
+			(info.get('name') or '').lower() == 'type'
+			and (info.text or '').strip().lower() in ('audio', 'video')
+			for info in root.findall('.//info')
+		)
+
+	def _discard_process(self):
+		"""Bound cleanup as well as startup; reap a failed child when possible."""
+		process = self.process
+		if process is None:
+			return
+		try:
+			if process.poll() is None:
+				process.kill()
+			process.wait(timeout=1)
+		except (OSError, subprocess.TimeoutExpired):
+			logging.debug("VLC process cleanup did not complete", exc_info=True)
+		finally:
+			if getattr(process, 'stdin', None) is not None:
+				try:
+					process.stdin.close()
+				except OSError:
+					pass
+			self.process = None
+
+	def play_file(self, file_path, volume, params=None):
+		params = list(params or [])
+		try:
+			numeric_volume = float(volume)
+			if not math.isfinite(numeric_volume) or numeric_volume < 0:
+				raise ValueError("volume must be a finite nonnegative number")
+			# VLC's HTTP volume scale is 0..512; clamping also handles normalization.
+			volume = min(512, round(numeric_volume))
+		except (TypeError, ValueError, OverflowError) as exc:
+			raise PlaybackError("Invalid VLC volume: %r" % (volume,)) from exc
+
+		with self._status_lock:
+			self.playback_generation = getattr(self, 'playback_generation', 0) + 1
+			generation = self.playback_generation
+			self.is_transposing = True
+		deadline = time.monotonic() + self.startup_timeout
 		try:
 			file_path = self.process_file(file_path)
-			self.is_transposing = True
-			if self.process is not None and self.process.poll() is None:
-				logging.debug("VLC is currently playing, stopping track...")
-				# must wait for VLC to quit or force kill, otherwise VLC http server will be borked
+			if self._process_running():
+				logging.debug("Stopping previous VLC process before playback")
+				self.command("pl_stop", save_status=False, deadline=min(deadline, time.monotonic() + 2), max_attempts=1)
 				try:
-					self.stop()
-					self.process.wait(2)
-				except:
-					self.process.kill()
-			command = self.cmd_base + params + [file_path]
-			if self.platform == 'osx' and not os.K.full_screen:
-				command.remove('--fullscreen')
-				command.remove('--macosx-nativefullscreenmode')
-			logging.info("VLC Command: %s" % command)
-
-			self.process = subprocess.Popen(command, stdin = subprocess.PIPE)
-
-			# wait for the process to start
-			while self.process.poll() is not None:
-				pass
-
-			# wait for VLC HTTP is ready
-			while True:
-				time.sleep(0.1)
-				req = self.command("", False)
-				xml = req.text
-				if "<info name='Type'>Video</info>" not in xml and "<info name='Type'>Audio</info>" not in xml:
+					self.process.wait(timeout=max(0.01, min(2, deadline - time.monotonic())))
+				except subprocess.TimeoutExpired:
 					pass
-				elif req.status_code == 200:
+			self._discard_process()
+			self.current_file_path = None
+			self.last_status_text = ""
+			self.last_status_time = 0.0
+			command = self.cmd_base + params + [file_path]
+			if self.platform == 'osx' and not getattr(getattr(os, 'K', None), 'full_screen', True):
+				command = [arg for arg in command if arg not in ('--fullscreen', '--macosx-nativefullscreenmode')]
+			logging.debug("Starting VLC for %s", file_path)
+			self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
+			expected_state = 'paused' if '--start-paused' in params else 'playing'
+
+			def check_startup():
+				if self.playback_generation != generation:
+					raise PlaybackError("VLC startup was interrupted by another transition")
+				if not self._process_running():
+					raise PlaybackError("VLC exited before media was ready: %s" % file_path)
+				if time.monotonic() >= deadline:
+					raise PlaybackError("VLC startup timed out: %s" % file_path)
+
+			while True:
+				check_startup()
+				response = self.command('', save_status=False, deadline=deadline, max_attempts=1)
+				xml = response.text
+				if response.status_code == 200 and self._has_media(xml):
 					break
+				time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
-			# workaround --volume-save not working in Windows
-			okay = False
-			while volume and not okay:
+			# Set zero explicitly too, so a previously saved volume cannot defeat mute.
+			while True:
+				check_startup()
+				response = self.command(f"volume&val={volume}", save_status=False, deadline=deadline, max_attempts=1)
+				xml = response.text
 				try:
-					volume = round(volume)
-					xml = self.command(f"volume&val={volume}", False).text
-					if int(self.get_val_xml(xml, 'volume')) == volume:
-						okay = True
-					if not os.K.is_paused and self.get_val_xml(xml, 'state') != 'playing':
-						okay = False
-				except:
-					time.sleep(0.1)
+					volume_ready = int(self.get_val_xml(xml, 'volume')) == volume
+				except (TypeError, ValueError):
+					volume_ready = False
+				if response.status_code == 200 and volume_ready and self.get_val_xml(xml, 'state') == expected_state:
+					break
+				time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
-			self.is_transposing = False
+			cache_time = time.monotonic()
+			with self._status_lock:
+				if self.playback_generation != generation:
+					raise PlaybackError("VLC startup was interrupted by another transition")
+				self.current_file_path = file_path
+				getattr(self, '_audio_probe_failed_at', {}).pop(self._media_key(file_path), None)
+				self.last_status_text = xml
+				self.last_status_time = cache_time
 			return xml
-
-		except Exception as e:
-			logging.error("Playing file failed: " + str(e))
-			self.is_transposing = False
+		except Exception as exc:
+			if self.playback_generation == generation:
+				self._discard_process()
+				self.current_file_path = None
+				self.last_status_text = ""
+				self.last_status_time = 0.0
+			if isinstance(exc, PlaybackError):
+				raise
+			raise PlaybackError("Unable to play %s: %s" % (file_path, exc)) from exc
+		finally:
+			if self.playback_generation == generation:
+				self.is_transposing = False
 
 	def play_file_transpose(self, file_path, semitones, volume, extra_params = []):
 		# --speex-resampler-quality=<integer [0 .. 10]>
@@ -219,51 +310,59 @@ class VLCClient:
 		logging.debug("Transposing file...")
 		return self.play_file(file_path, volume, params + extra_params)
 
-	def command(self, command = '', save_status=True):
-		self.last_status_time = time.time()
+	def command(self, command='', save_status=True, deadline=None, max_attempts=3):
+		token = self._playback_token()
 		is_status_probe = command in ("", "pl_info")
-		if not self.is_running():
-			if not is_status_probe:
-				logging.debug("Skipping VLC command while player is not running: %s", command)
-			return SimpleNamespace(**{'text': self.last_status_text, 'status_code': 500})
+		if not self._process_running():
+			return SimpleNamespace(text=self.last_status_text, status_code=500)
 		last_exc = None
-		for _ in range(10):
+		for attempt in range(max_attempts):
+			if not self._same_playback(token):
+				return SimpleNamespace(text='', status_code=409)
+			if deadline is not None and time.monotonic() >= deadline:
+				break
 			try:
-				url = self.http_command_endpoint + command
-				request = requests.get(url, auth = ("", self.http_password), timeout = 0.5)
-				if self.is_transposing and save_status:
-					return SimpleNamespace(**{'text': self.last_status_text, 'status_code': request.status_code})
-				if save_status:
-					self.last_status_text = request.text
-					os.K.has_video = "<info name='Type'>Video</info>" in request.text
-				if not os.K.now_playing:
-					# by right, here should never be reached
-					request.encoding = 'utf-8'
-					os.K.now_playing_filename = unescape(unescape(self.get_val_xml(request.text, "info name='filename'")))
-					if not os.path.isfile(os.K.now_playing_filename):
-						if not os.path.isabs(os.K.now_playing_filename):
-							os.K.now_playing_filename = os.path.join(os.K.library_root, os.K.now_playing_filename)
-					os.K.now_playing = os.K.filename_from_path(os.K.now_playing_filename)
-				return request
-			except Exception as exc:
+				timeout = self.request_timeout
+				if deadline is not None:
+					timeout = max(0.001, min(timeout, deadline - time.monotonic()))
+				response = requests.get(self.http_command_endpoint + command, auth=("", self.http_password), timeout=timeout)
+				valid_status = False
+				if response.status_code == 200 and save_status and command != "pl_info":
+					# Cache only a successful status document, not failed requests or playlist info.
+					try:
+						root = ET.fromstring(response.text)
+					except (ET.ParseError, TypeError, ValueError):
+						pass
+					else:
+						valid_status = root.tag == 'root' and root.find('state') is not None
+				cache_time = time.monotonic()
+				with self._status_lock:
+					if not self._same_playback(token):
+						return SimpleNamespace(text='', status_code=409)
+					if valid_status and not self.is_transposing:
+						self.last_status_text = response.text
+						self.last_status_time = cache_time
+				return response
+			except requests.RequestException as exc:
+				if not self._same_playback(token):
+					return SimpleNamespace(text='', status_code=409)
 				last_exc = exc
 				if len(self.http_hosts) > 1:
-					# swap host if loopback choice isn't reachable yet
 					self.http_hosts = self.http_hosts[1:] + self.http_hosts[:1]
 					self.http_host = self.http_hosts[0]
 					self.http_endpoint = "http://%s:%s/requests/status.xml" % (self.http_host, self.port)
 					self.http_command_endpoint = self.http_endpoint + "?command="
-				if is_status_probe and not self.is_running():
+				if not self._process_running():
 					break
-				time.sleep(0.1)
-		if is_status_probe:
-			if not self.is_running():
-				logging.debug("VLC stopped before status probe completed: %s (%s)", command or "status", last_exc)
-			else:
-				logging.debug("VLC status probe failed while player was transitioning: %s (%s)", command or "status", last_exc)
-		else:
-			logging.error("No active VLC process. Could not run command: %s (%s)", command, last_exc)
-		return SimpleNamespace(**{'text': self.last_status_text, 'status_code': 500})
+				if attempt + 1 < max_attempts:
+					remaining = 0.1 if deadline is None else min(0.1, max(0, deadline - time.monotonic()))
+					time.sleep(remaining)
+		log = logging.debug if is_status_probe else logging.warning
+		log("VLC command failed: %s (%s)", command or "status", last_exc)
+		with self._status_lock:
+			if not self._same_playback(token):
+				return SimpleNamespace(text='', status_code=409)
+			return SimpleNamespace(text=self.last_status_text, status_code=500)
 
 	def pause(self, save_status=True):
 		return self.command("pl_pause", save_status)
@@ -323,7 +422,17 @@ class VLCClient:
 		return sorted(found)
 
 	def get_audio_track_info(self, xml=None, file_path=None):
-		status_xml = xml or self.get_status()
+		token = self._playback_token()
+		cache_key = self._media_key(file_path or getattr(self, 'current_file_path', None))
+		active_key = self._media_key(getattr(self, 'current_file_path', None))
+		# A query for the next file must never borrow the previous player's status.
+		active_target = file_path is None or (cache_key is not None and cache_key == active_key)
+		status_xml = ""
+		if active_target:
+			if xml is not None:
+				status_xml = xml
+			elif self._process_running():
+				status_xml = self.get_status()
 
 		def safe_text(val):
 			if val is None:
@@ -403,89 +512,98 @@ class VLCClient:
 
 		def probe_audio_streams(path):
 			if not path:
-				return []
+				return [], None
 			if shutil.which("ffprobe"):
 				cmd = [
 					"ffprobe", "-v", "error", "-select_streams", "a",
 					"-show_entries", "stream=index", "-of", "csv=p=0", path
 				]
 				try:
-					out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
-					return [int(line.strip()) for line in out.splitlines() if line.strip()]
-				except Exception:
-					return []
+					out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=self.probe_timeout)
+					indices = [int(line.strip()) for line in out.splitlines() if line.strip()]
+					if indices:
+						return indices, "ffprobe"
+				except (OSError, ValueError, subprocess.SubprocessError):
+					logging.debug("ffprobe audio metadata unavailable for %s", path, exc_info=True)
 			if shutil.which("ffmpeg"):
 				cmd = ["ffmpeg", "-hide_banner", "-i", path]
 				try:
-					proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-					lines = proc.stderr.splitlines()
+					proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=self.probe_timeout)
 					indices = []
-					for line in lines:
+					for line in proc.stderr.splitlines():
 						if "Stream #" in line and "Audio:" in line:
-							match = re.search(r"Stream #\\d+:(\\d+)", line)
+							match = re.search(r"Stream #\d+:(\d+)", line)
 							if match:
-								try:
-									indices.append(int(match.group(1)))
-								except ValueError:
-									pass
-					return indices
-				except Exception:
-					return []
-			return []
+								indices.append(int(match.group(1)))
+					return indices, "ffmpeg"
+				except (OSError, ValueError, subprocess.SubprocessError):
+					logging.debug("ffmpeg audio metadata unavailable for %s", path, exc_info=True)
+			return [], None
 
-		cache_key = file_path
-		if cache_key and cache_key in self.audio_track_cache:
-			cached_ids = self.audio_track_cache[cache_key]
-		else:
-			cached_ids = None
-
+		cached_ids = self.audio_track_cache.get(cache_key) if cache_key else None
 		current_id, track_ids, stream_count, source = parse_xml_tracks(status_xml)
-		if cached_ids:
-			track_ids = cached_ids
-			source = "cache"
 
-		if not track_ids or current_id is None or stream_count == 0:
+		if active_target and self._process_running() and (not track_ids or current_id is None):
 			try:
-				info_xml = self.command("pl_info", save_status=False).text
-				info_current, info_tracks, info_stream_count, info_source = parse_xml_tracks(info_xml)
+				info_xml = self.command("pl_info", save_status=False, max_attempts=1).text
+				info_current, info_tracks, info_stream_count, _ = parse_xml_tracks(info_xml)
 				if current_id is None:
 					current_id = info_current
 				if not track_ids and info_tracks:
 					track_ids = info_tracks
 					source = "pl_info"
-				if stream_count == 0 and info_stream_count:
+				if stream_count == 0:
 					stream_count = info_stream_count
-			except Exception:
-				pass
+			except (OSError, requests.RequestException):
+				logging.debug("VLC audio metadata unavailable", exc_info=True)
+		if not self._same_playback(token):
+			return None, [], 'stale'
+
+		# Fresh explicit track IDs take precedence over any earlier cache entry.
+		if not track_ids and cached_ids and (not stream_count or len(cached_ids) == stream_count):
+			track_ids = list(cached_ids)
+			source = "cache"
+
+		if not hasattr(self, '_audio_probe_failed_at'):
+			self._audio_probe_failed_at = {}
+		failed_at = self._audio_probe_failed_at.get(cache_key)
+		if not track_ids and (failed_at is None or time.monotonic() - failed_at >= self.probe_retry_interval):
+			track_ids, source = probe_audio_streams(file_path or getattr(self, 'current_file_path', None))
+			if not self._same_playback(token):
+				return None, [], 'stale'
+			if cache_key and not track_ids:
+				# A missing tool or slow/unreadable file must not trigger probes on every UI poll.
+				failed_time = time.monotonic()
+				with self._status_lock:
+					if not self._same_playback(token):
+						return None, [], 'stale'
+					self._audio_probe_failed_at[cache_key] = failed_time
 
 		if not track_ids and stream_count > 0:
 			base = 0 if current_id == 0 else 1
 			track_ids = list(range(base, base + stream_count))
 			source = "stream_count"
-			logging.debug("Fallback audio tracks via stream count: %s (current=%s)", track_ids, current_id)
 
-		if not track_ids:
-			stream_indices = probe_audio_streams(file_path)
-			if stream_indices:
-				track_ids = stream_indices
-				source = "ffprobe"
-				logging.debug("Fallback audio tracks via ffprobe/ffmpeg: %s (current=%s)", track_ids, current_id)
-
-		if cache_key and track_ids:
-			self.audio_track_cache[cache_key] = track_ids
-
+		with self._status_lock:
+			if not self._same_playback(token):
+				return None, [], 'stale'
+			if cache_key and track_ids and source != "stream_count":
+				self.audio_track_cache[cache_key] = list(track_ids)
+				self._audio_probe_failed_at.pop(cache_key, None)
 		return current_id, track_ids, source or "unknown"
 
 	def seek(self, seek_sec):
 		return self.command(f"seek&val={seek_sec}")
 
 	def stop(self):
-		try:
-			return self.command("pl_stop")
-		except:
-			e = sys.exc_info()[0]
-			logging.warn(f"Track stop: server may have shut down before http return code received: {e}")
-			return
+		response = self.command("pl_stop", max_attempts=1)
+		if self.process is not None:
+			try:
+				self.process.wait(timeout=1)
+			except subprocess.TimeoutExpired:
+				pass
+		self.kill()
+		return response
 
 	def restart(self):
 		logging.info(self.command("seek&val=0"))
@@ -508,11 +626,14 @@ class VLCClient:
 		return self.command(f"audio_track&val={track_id}")
 
 	def kill(self):
-		try:
-			if self.process is not None: self.process.kill()
-		except (OSError, AttributeError) as e:
-			print(e)
-		return
+		with self._status_lock:
+			self.playback_generation = getattr(self, 'playback_generation', 0) + 1
+		self._discard_process()
+		with self._status_lock:
+			self.current_file_path = None
+			self.last_status_text = ""
+			self.last_status_time = 0.0
+			self.is_transposing = False
 
 	def is_running(self):
 		return (self.process != None and self.process.poll() == None) or self.is_transposing
@@ -534,14 +655,15 @@ class VLCClient:
 			return False
 
 	def get_status(self):
+		token = self._playback_token()
 		if self.is_transposing:
 			return self.last_status_text
-		cur_time = time.time()
-		if abs(cur_time-self.last_status_time)>1:
-			try:
-				self.command()
-				return self.last_status_text
-			except: pass
+		if not self._process_running():
+			return ""
+		if time.monotonic() - self.last_status_time >= self.status_interval:
+			self.command()
+		if not self._same_playback(token):
+			return ''
 		return self.last_status_text
 
 	def run(self):

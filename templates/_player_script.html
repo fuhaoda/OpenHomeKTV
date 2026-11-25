@@ -1,0 +1,119 @@
+<script>
+var transpose_seeking = false, seektrack_seeking = false, playspeed_seeking = false;
+var audiodelay_typing = false, playspeed_typing = false, subdelay_typing = false, volume_changing = false;
+(function () {
+  function initializePlayer() {
+    var spa = typeof switch_pane === 'function';
+    var loadSequence = spa ? paneLoadSeq : null;
+    var stopped = false, pending = null, obj = {};
+    function active() { return !stopped && (!spa || (last_pane === '/f_home' && paneLoadSeq === loadSequence)); }
+    function finite(value, fallback) { return value !== null && Number.isFinite(Number(value)) ? Number(value) : fallback; }
+    function semitones(value) { return (Number(value) > 0 ? '+' : '') + finite(value, 0) + {{getString1(91)|tojson}}; }
+    function update(data) {
+      if (!active()) return;
+      var parsed = KTV.parseData(data);
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return;
+      obj = parsed;
+      KTV.renderSong(document.getElementById('now-playing'), obj.now_playing, obj.now_playing_user, {{getString1(69)|tojson}});
+      KTV.renderSong(document.getElementById('up-next'), obj.up_next, obj.next_user, {{getString1(70)|tojson}});
+      $('.control-box').toggle(!!obj.now_playing);
+      if (!transpose_seeking) {
+        $('#transpose').val(finite(obj.transpose_value, 0));
+        $('#semitones-label').text(semitones(obj.transpose_value));
+        $('#reset_key').text(obj.transpose_value ? {{getString1(204)|tojson}} : {{getString1(68)|tojson}})
+          .toggleClass('boxedText', !!obj.transpose_value);
+      }
+      var speed = finite(obj.play_speed, 1);
+      if (!playspeed_seeking) $('#playspeed').val(Math.round(speed * 100)).toggle(speed >= 0.8 && speed <= 1.2);
+      if (!playspeed_typing) $('#playspeed-val').text(speed.toFixed(2));
+      $('#reset_speed').text(speed !== 1 ? {{getString1(205)|tojson}} : {{getString1(199)|tojson}}).toggleClass('boxedText', speed !== 1);
+      if (!seektrack_seeking) {
+        $('#seektrack').attr('max', finite(obj.seektrack_max, 0)).val(finite(obj.seektrack_value, 0));
+        $('#seektrack-val').text(KTV.formatTime(obj.seektrack_value));
+        $('#seektrack-max').text(KTV.formatTime(obj.seektrack_max));
+      }
+      if (!audiodelay_typing) $('#delay-val').text(finite(obj.audio_delay, 0).toFixed(2));
+      $('#subdelay-box').toggle(Object.prototype.hasOwnProperty.call(obj, 'subtitle_delay'));
+      if (!subdelay_typing) $('#subdelay-val').text(finite(obj.subtitle_delay, 0).toFixed(1));
+      $('#subtitle-sel').css('text-decoration', obj.show_subtitle === false ? 'line-through' : '');
+      var total = finite(obj.audio_track_total, 1), index = finite(obj.audio_track_index, 1);
+      $('#audio-track-status').text(index + '/' + total);
+      $('#next-audio-track').prop('disabled', total <= 1);
+      $('#pause-resume').toggleClass('icon-pause', !obj.is_paused).toggleClass('icon-play', !!obj.is_paused);
+      $('#playing_gif').toggle(!obj.is_paused && !!obj.now_playing);
+      $('#playing_png').toggle(!!obj.is_paused && !!obj.now_playing);
+      $('.playing_gif').attr('src', obj.is_paused ? '/static/images/now-playing.png' : '/static/images/now-playing.gif');
+      if (!volume_changing) $('#vol').text(finite(obj.volume, 0));
+      $('#vol').toggleClass('boxedText', !!obj.vol_norm);
+    }
+    function refresh() {
+      if (!active() || pending) return;
+      pending = $.get('/nowplaying').done(function (data) { if (active()) update(data); })
+        .always(function () { pending = null; });
+    }
+    function command(url, data) {
+      return $.get(url, data).fail(KTV.showRequestError).always(function () { if (active()) refresh(); });
+    }
+    function owner() {
+      return obj.now_playing_user === 'Random' || Cookies.get('user') === obj.now_playing_user;
+    }
+    $('.control-box').hide();
+    $('#next-audio-track').on('click', function () {
+      var button = this;
+      button.disabled = true;
+      command('/next_audio_track').always(function () { if (active()) button.disabled = finite(obj.audio_track_total, 1) <= 1; });
+    });
+    $('#pause-resume').on('click', function () { command('/pause'); });
+    $('#restart').on('click', function () { if (owner() || confirm({{getString1(71)|tojson}})) command('/restart'); });
+    $('#skip').on('click', function () { if (owner() || confirm({{getString1(72)|tojson}})) command('/skip'); });
+    $('#vol-up').on('click', function () { command('/vol_up'); });
+    $('#vol-down').on('click', function () { command('/vol_down'); });
+    function numericEditor(selector, endpoint, fallback, typing) {
+      $(selector).on('focus', function () { typing(true); }).on('keydown', function (event) {
+        if (event.key === 'Enter') { event.preventDefault(); this.blur(); }
+      }).on('blur', function () {
+        var value = Number($(this).text().trim() || fallback);
+        typing(false);
+        if (!Number.isFinite(value)) { refresh(); return; }
+        $(this).text(value);
+        command(endpoint + encodeURIComponent(value));
+      }).on('paste', function (event) {
+        event.preventDefault();
+        var clipboard = (event.originalEvent || event).clipboardData;
+        this.textContent = clipboard ? clipboard.getData('text/plain') : this.textContent;
+      });
+    }
+    numericEditor('#vol', '/vol/', 0, function (value) { volume_changing = value; });
+    numericEditor('#delay-val', '/audio_delay/', 0, function (value) { audiodelay_typing = value; });
+    numericEditor('#subdelay-val', '/subtitle_delay/', 0, function (value) { subdelay_typing = value; });
+    numericEditor('#playspeed-val', '/play_speed/', 1, function (value) { playspeed_typing = value; });
+    function slider(selector, endpoint, convert, typing, preview) {
+      $(selector).on('pointerdown touchstart', function () { typing(true); })
+        .on('pointerup pointercancel touchend touchcancel', function () { typing(false); })
+        .on('input', function () { if (preview) preview(convert(Number(this.value))); })
+        .on('change', function () { typing(false); command(endpoint + encodeURIComponent(convert(Number(this.value)))); });
+    }
+    slider('#transpose', '/transpose/', function (value) { return value; }, function (value) { transpose_seeking = value; }, function (value) { $('#semitones-label').text(semitones(value)); });
+    slider('#seektrack', '/seek/', function (value) { return value; }, function (value) { seektrack_seeking = value; }, function (value) { $('#seektrack-val').text(KTV.formatTime(value)); });
+    slider('#playspeed', '/play_speed/', function (value) { return value / 100; }, function (value) { playspeed_seeking = value; }, function (value) { $('#playspeed-val').text(value.toFixed(2)); });
+    $('#reset_key').off('click').on('click', function () { command('/transpose/0'); });
+    $('#reset_speed').off('click').on('click', function () { command('/play_speed/1'); });
+    $('#subtitle-sel').on('click', function () { command('/toggle_subtitle'); });
+    $('#delay-inc').on('click', function () { command('/audio_delay/+'); });
+    $('#delay-dec').on('click', function () { command('/audio_delay/-'); });
+    $('#subdelay-inc').on('click', function () { command('/subtitle_delay/+'); });
+    $('#subdelay-dec').on('click', function () { command('/subtitle_delay/-'); });
+    $('#audiodelay-info').on('click', function () { showNotification({{getString1(60)|tojson}}, 'is-info', 8000); });
+    $('#subdelay-info').on('click', function () { showNotification({{getString1(61)|tojson}}, 'is-info', 8000); });
+    $('#semitones-info').on('click', function () { showNotification({{getString1(62)|tojson}}, 'is-info', 10000); });
+    $('#playspeed-info').on('click', function () { showNotification({{getString1(200)|tojson}}, 'is-info', 10000); });
+    var poll = setInterval(refresh, 1500);
+    function stop() { stopped = true; clearInterval(poll); if (pending) pending.abort(); }
+    if (spa) { window.updateNowPlaying = update; window.paneCleanup = stop; }
+    else window.addEventListener('pagehide', stop, {once: true});
+    refresh();
+  }
+  if (document.readyState === 'loading') $(initializePlayer);
+  else initializePlayer();
+}());
+</script>

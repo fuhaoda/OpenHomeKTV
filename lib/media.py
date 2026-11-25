@@ -6,6 +6,14 @@ import os
 from constants import media_types
 
 
+def media_title(file_path, strip_suffix=True):
+    """Return a nonempty filename-based title, including for Unicode-only names."""
+    basename = os.path.basename(os.fsdecode(file_path))
+    stem = os.path.splitext(basename)[0] or basename
+    title = stem.split('---', 1)[0] if strip_suffix else stem
+    return title or stem or basename or 'Untitled'
+
+
 def iter_media_files(media_dir, seen_directories=None):
     """Yield videos, sharing visited directories across roots to avoid overlap.
 

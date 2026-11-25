@@ -12,6 +12,8 @@
   <script src="/static/jquery-ui.min.js"></script>
   <script src="/static/js.cookie-2.2.1.min.js"></script>
   <script src="/static/lodash.min.js"></script>
+  <script src="/static/jquery.ui.touch-punch.min.js"></script>
+  <script src="/static/app.js"></script>
   <link rel="stylesheet" href="/static/jquery-ui.min.css">
   <link rel="stylesheet" href="/static/bulma-dark.css">
   <link rel="stylesheet" href="/static/custom.css">
@@ -37,7 +39,7 @@ function setLanguage(lang, reload){
 }
 
 $(function () {
-  $("#notification-close").click(function () {
+  $(".notification .delete").click(function () {
     $(".notification").hide();
   });
   $("#notification-alt").hide()
@@ -76,17 +78,15 @@ $(function () {
     $("#current-user").removeClass("is-hidden");
   };
 
-  $('#current-user').click(function(e) {
-    e.preventDefault();
-    let name = window.prompt(
-      "{{getString1(133)}}" + currentUser
-    );
-    if (name) {
-      Cookies.set("user", name, { expires: 3650 })
-    }
-    location.reload();
+  $('#current-user').click(function(event) {
+    event.preventDefault();
+    var name = window.prompt({{getString1(133)|tojson}} + (currentUser || ''), currentUser);
+    if (name) $.post('/user_rename', {old_name: currentUser || '', new_name: name}).done(function () {
+      Cookies.set('user', name, {expires: 3650});
+      location.reload();
+    }).fail(KTV.showRequestError);
   });
-  
+
   // handle browser language
   var currentLang = Cookies.get("lang");
   if(!currentLang){
@@ -94,16 +94,19 @@ $(function () {
     setLanguage(currentLang, false);
   }
 
-  $('#current-lang').click(function(e) {
-    e.preventDefault();
-    $.get('/get_lang_list').done(function(lang_json){
-      var lang_dict = JSON.parse(lang_json);
-      var popup_html = '';
-      for(var lang1 in lang_dict){
-        popup_html += `<input type="radio" onclick="setLanguage('${lang1}', true);" ${currentLang==lang1?"checked":""}>&nbsp;${lang_dict[lang1]}<br>`;
-      }
-      var popUpList = $(`<div title="{{getString1(185)}}">${popup_html}</div>`)
-      popUpList.dialog();
+  $('#current-lang').click(function(event) {
+    event.preventDefault();
+    $.get('/get_lang_list').done(function(data) {
+      var languages = KTV.parseData(data);
+      if (!languages || typeof languages !== 'object') return;
+      var popup = $('<div>').attr('title', {{getString1(185)|tojson}});
+      Object.keys(languages).forEach(function(language) {
+        var label = $('<label>').addClass('language-choice');
+        $('<input>', {type: 'radio', name: 'language', checked: currentLang === language})
+          .on('change', function() { setLanguage(language, true); }).appendTo(label);
+        label.append(document.createTextNode(' ' + languages[language])).appendTo(popup);
+      });
+      popup.dialog({width: Math.min(400, window.innerWidth - 24), close: function() { popup.dialog('destroy').remove(); }});
     });
   });
 });
@@ -119,13 +122,10 @@ $(function () {
 }
 .above_overlay{ position:fixed; width:50%; height:32%; left:50%; top: 50%; transform: translate(-50%, -50%); z-index: 200; display: none; }
 .navbar-item > i { margin-right: 2px; font-size: 24px; }
-.notification { position: fixed; width: 500px; bottom: 5px; left: 50%; margin-left: -250px; z-index: 20; }
 .current-user { position: fixed; padding: 3px; bottom: 5px; right: 10px; }
 tr:nth-child(even) { background-color: rgb(50, 55, 55); }
 @media screen and (max-width: 500px) {
   .navbar-brand > .navbar-item > span { display: none; }
-  .notification { position: fixed; width: 100%; bottom: 5px; left: 0px; margin-left: 0px; }
-  body { min-height: 120vh; }
 }
 </style>
 

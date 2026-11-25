@@ -174,6 +174,28 @@ class ApplicationTests(unittest.TestCase):
         with patch.object(self.library, 'queue_clear', return_value=False):
             self.assertEqual(self.client.get('/queue/edit?action=clear').status_code, 409)
 
+    def test_drag_reorder_detects_concurrent_reorder_even_when_length_is_unchanged(self):
+        songs = self.library.available_songs[:3]
+        for song in songs:
+            self.library.enqueue(song, 'Singer')
+        self.assertTrue(self.library.queue_edit(songs[1], 'up'))
+        before = [item['file'] for item in self.library.queue]
+        response = self.client.post('/queue/edit', data={
+            'action': 'move', 'from': '0', 'to': '2', 'size': '3', 'order': json.dumps(songs),
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual([item['file'] for item in self.library.queue], before)
+
+    def test_drag_reorder_accepts_current_order_in_post_body(self):
+        songs = self.library.available_songs[:3]
+        for song in songs:
+            self.library.enqueue(song, 'Singer')
+        response = self.client.post('/queue/edit', data={
+            'action': 'move', 'from': '0', 'to': '2', 'size': '3', 'order': json.dumps(songs),
+        }, headers={'X-Requested-With': 'XMLHttpRequest'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['file'] for item in self.library.queue], songs[1:] + songs[:1])
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_empty_local_configuration_falls_back_to_main(self):

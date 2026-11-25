@@ -310,10 +310,11 @@ def add_random():
 	return ''
 
 
-@app.route("/queue/edit", methods = ["GET"])
+@app.route("/queue/edit", methods = ["GET", "POST"])
 def queue_edit():
 	is_xhr = request.headers.get("X-Requested-With") == "XMLHttpRequest"
-	action = request.args["action"]
+	values = request.values
+	action = values["action"]
 	if action not in ('clear', 'move', 'up', 'down', 'delete'):
 		return 'Unknown queue action', 400
 	if action == "clear":
@@ -323,19 +324,26 @@ def queue_edit():
 		return '' if is_xhr else redirect(url_for("queue"))
 	elif action == "move":
 		try:
-			id_from = request.args['from']
-			id_to = request.args['to']
-			id_size = request.args['size']
+			id_from = values['from']
+			id_to = values['to']
+			id_size = values['size']
 		except KeyError:
 			return 'Move requires from, to and size', 400
-
-		result = K.queue_edit(None, "move", src=id_from, tgt=id_to, size=id_size)
+		expected_order = None
+		if 'order' in values:
+			try:
+				expected_order = json.loads(values['order'])
+			except (ValueError, TypeError):
+				return 'Invalid queue order', 400
+			if not isinstance(expected_order, list) or not all(isinstance(path, str) for path in expected_order):
+				return 'Invalid queue order', 400
+		result = K.queue_edit(None, "move", src=id_from, tgt=id_to, size=id_size, expected_order=expected_order)
 		if result:
 			flash(f"{getString(8)} {id_from}->{id_to}/{id_size}")
 		else:
-			flash(f"{getString(9)} {id_from}->{id_to}/{id_size}")
+			return jsonify(success=False, error='The queue changed while you were dragging. The list will refresh; please try again.'), 409
 	else:
-		song = request.args["song"]
+		song = values["song"]
 		song_title = filename_from_path(song)
 		# Flask has already decoded the query once; a second unquote corrupts
 		# real filenames containing strings such as "%20".

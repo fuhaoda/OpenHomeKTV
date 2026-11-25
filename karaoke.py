@@ -601,6 +601,9 @@ class Karaoke:
 	@synchronized_state
 	def queue_edit(self, song_file, action, **kwargs):
 		if action == "move":
+			expected_order = kwargs.get('expected_order')
+			if expected_order is not None and expected_order != [item['file'] for item in self.queue]:
+				return False
 			try:
 				src, tgt, size = (int(kwargs[name]) for name in ('src', 'tgt', 'size'))
 			except (ValueError, TypeError, KeyError):

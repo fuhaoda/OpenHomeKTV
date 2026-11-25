@@ -76,3 +76,5 @@ The UI shows a "Next Audio Track" button and the current track count (for exampl
 node tests/test_frontend.js
 bash -n start.sh
 ```
+
+During forced WebSocket-disconnect testing, the bundled Flask/Werkzeug server can produce an `Invalid frame header` browser-console message. Automatic reconnect and subsequent queue updates have been verified. The upstream project documents [the same close-time behavior](https://github.com/miguelgrinberg/flask-sock/issues/20).

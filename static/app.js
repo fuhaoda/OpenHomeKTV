@@ -135,7 +135,10 @@
           start: function (_event, ui) { dragging = ui.item.index(); ui.item.data('queueStart', dragging); },
           stop: function () { dragging = null; },
           update: function (_event, ui) {
-            $.get('/queue/edit', {action: 'move', from: ui.item.data('queueStart'), to: ui.item.index(), size: songs.length})
+            $.post('/queue/edit', {
+              action: 'move', from: ui.item.data('queueStart'), to: ui.item.index(), size: songs.length,
+              order: JSON.stringify(songs.map(function (song) { return song.file; }))
+            })
               .fail(showRequestError).always(function () { lastPayload = null; refresh(); });
           }
         });

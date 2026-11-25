@@ -24,7 +24,9 @@
   if (isSpa) window.paneCleanup = controller.stop;
   var pane = document.getElementById('queue-pane');
   pane.querySelector('.queue-random').addEventListener('click', function () {
-    $.get('/queue/addrandom', {amount: 3}).fail(KTV.showRequestError).always(controller.refresh);
+    var user = KTV.ensureUserName();
+    if (!user) return;
+    $.get('/queue/addrandom', {amount: 3, user: user}).fail(KTV.showRequestError).always(controller.refresh);
   });
   pane.querySelector('.queue-clear').addEventListener('click', function () {
     if (window.confirm({{getString1(108)|tojson}})) {

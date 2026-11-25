@@ -113,9 +113,55 @@ class ApplicationTests(unittest.TestCase):
 
     def test_rename_accepts_slashes_and_quotes_without_path_routing(self):
         self.library.enqueue(self.library.available_songs[0], 'Old/Singer')
-        response = self.client.post('/user_rename', data={'old_name': 'Old/Singer', 'new_name': '小明/Don\'t "Singer"'})
+        response = self.client.post('/user_rename', data={'old_name': 'Old/Singer', 'new_name': '小明/Don\'"'})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.library.queue[0]['user'], '小明/Don\'t "Singer"')
+        self.assertEqual(self.library.queue[0]['user'], '小明/Don\'"')
+
+    def test_song_selection_requires_a_valid_name_without_changing_queue(self):
+        song = self.library.available_songs[0]
+        for invalid in (None, '', '   ', 'abcdefghijk', '一二三四五六七八九十甲', 'A\nB'):
+            with self.subTest(name=invalid):
+                parameters = {'song': song}
+                if invalid is not None:
+                    parameters['user'] = invalid
+                response = self.client.get('/enqueue', query_string=parameters)
+                self.assertEqual(response.status_code, 400)
+                self.assertFalse(response.json['success'])
+                self.assertTrue(response.json['error'])
+                self.assertEqual(self.library.queue, [])
+
+    def test_name_is_trimmed_and_ten_unicode_characters_are_accepted(self):
+        song = self.library.available_songs[0]
+        response = self.client.get('/enqueue', query_string={'song': song, 'user': '  一二三四五六七八九十  '})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.library.queue[0]['user'], '一二三四五六七八九十')
+
+    def test_invalid_rename_does_not_update_existing_queue(self):
+        self.library.enqueue(self.library.available_songs[0], 'Haoda')
+        for name in ('', '   ', 'abcdefghijk', '一二三四五六七八九十甲', 'A\tB'):
+            response = self.client.post('/user_rename', data={'old_name': 'Haoda', 'new_name': name})
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(self.library.queue[0]['user'], 'Haoda')
+        self.assertEqual(self.client.post('/user_rename', json=[]).status_code, 400)
+
+    def test_random_selection_requires_name_and_uses_it_for_songs(self):
+        for user in (None, '', 'TooLongName!'):
+            parameters = {'amount': 3}
+            if user is not None:
+                parameters['user'] = user
+            self.assertEqual(self.client.get('/queue/addrandom', query_string=parameters).status_code, 400)
+            self.assertEqual(self.library.queue, [])
+        response = self.client.get('/queue/addrandom', query_string={'amount': 3, 'user': '  Haoda  '})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.library.queue), 3)
+        self.assertEqual({song['user'] for song in self.library.queue}, {'Haoda'})
+
+    def test_legacy_websocket_song_selection_cannot_bypass_name_limit(self):
+        song = self.library.available_songs[0]
+        application.wscmd('test-phone', 'addsongs abcdefghijk\t' + song)
+        self.assertEqual(self.library.queue, [])
+        application.wscmd('test-phone', 'addsongs Haoda\t' + song)
+        self.assertEqual(self.library.queue[0]['user'], 'Haoda')
 
     def test_missing_and_invalid_arguments_return_client_errors(self):
         for route in ('/enqueue', '/queue/addrandom?amount=invalid', '/queue/edit?action=move',

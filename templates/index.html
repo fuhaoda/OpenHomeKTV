@@ -141,20 +141,18 @@ $('.navbar-burger').on('click', function () {
   $('.navbar-burger, .navbar-menu').toggleClass('is-active');
 });
 function set_user(user) {
-  currentUser = user;
-  Cookies.set('user', currentUser, {expires: 3650});
-  $('#current-user span').text(currentUser);
+  return KTV.rememberUserName(user);
 }
 function load_cur_user() {
-  var user = Cookies.get('user');
-  if (user == null) $.get('/auto_username').done(set_user);
-  else set_user(user);
+  currentUser = KTV.initializeUserName();
 }
 $('#current-user').on('click', function (event) {
   event.preventDefault();
-  var name = window.prompt({{getString1(133)|tojson}} + (currentUser || ''), currentUser);
-  if (name) {
-    $.post('/user_rename', {old_name: currentUser || '', new_name: name}).done(function () {
+  var oldName = KTV.getSavedUserName();
+  var name = KTV.promptUserName(oldName || '');
+  if (name !== null) {
+    if (!oldName) { set_user(name); closeNav(); return; }
+    $.post('/user_rename', {old_name: oldName, new_name: name}).done(function () {
       set_user(name); closeNav();
     }).fail(KTV.showRequestError);
   }

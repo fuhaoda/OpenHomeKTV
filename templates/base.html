@@ -71,18 +71,16 @@ $(function () {
   setTimeout(function() { $("#notification").fadeOut()}, 3000);
 
   // handle current user display
-  var currentUser = Cookies.get("user");
-
-  if (currentUser) {
-    $("#current-user span").text(currentUser)
-    $("#current-user").removeClass("is-hidden");
-  };
+  KTV.initializeUserName();
 
   $('#current-user').click(function(event) {
     event.preventDefault();
-    var name = window.prompt({{getString1(133)|tojson}} + (currentUser || ''), currentUser);
-    if (name) $.post('/user_rename', {old_name: currentUser || '', new_name: name}).done(function () {
-      Cookies.set('user', name, {expires: 3650});
+    var oldName = KTV.getSavedUserName();
+    var name = KTV.promptUserName(oldName || '');
+    if (name === null) return;
+    if (!oldName) { KTV.rememberUserName(name); return; }
+    $.post('/user_rename', {old_name: oldName, new_name: name}).done(function () {
+      KTV.rememberUserName(name);
       location.reload();
     }).fail(KTV.showRequestError);
   });

@@ -46,7 +46,7 @@ From the repository folder, start with one command:
 ```
 The script activates `.venv`, changes to the repository directory, and passes arguments to the app. It also works from another directory when invoked by its full path. Stop the app with Ctrl+C.
 
-To use a different port or initial volume (VLC volume scale `0..512`; the default is muted):
+The app starts at volume **250** by default, including when run directly with Python. To use a different port or override the initial volume (VLC volume scale `0..512`):
 ```
 ./start.sh --port 5010 --volume 128
 ```
@@ -66,6 +66,8 @@ The UI shows a "Next Audio Track" button and the current track count (for exampl
 ## Playback and phone controls
 - A failed or unavailable video is logged and skipped so the remaining queue can continue. Player startup and media probes have timeouts.
 - Phone queues fit narrow screens, wrap long song and singer names, and keep the usual browser zoom available.
+- Queue rows are compact, with the singer name and song title on the same line and horizontal move controls. Long titles still wrap within the screen.
+- Before the first song selection, enter a name of 1–10 characters. Names are trimmed and remembered on that browser; blank or overlong names are rejected. The same rule applies when renaming or adding random songs, and the server checks it too.
 - Browser updates use JSON messages with reconnect and polling fallback. Multiple tabs on one phone have independent connections.
 - Saved audio/subtitle delays distinguish videos with identical filenames in different folders. Existing filename-based settings remain readable; updates are saved by full path.
 - Optional volume normalization needs FFmpeg on `PATH`. It analyzes up to the first 60 seconds of a selected song on demand, with a 45-second timeout, and caches the result. It does not analyze the whole library during scanning.
@@ -74,6 +76,7 @@ The UI shows a "Next Audio Track" button and the current track count (for exampl
 ```
 .venv/bin/python -m unittest discover -s tests -v
 node tests/test_frontend.js
+node tests/test_names.js
 bash -n start.sh
 ```
 

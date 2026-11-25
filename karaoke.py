@@ -13,6 +13,7 @@ from functools import wraps
 
 from lib.media import media_title
 from lib.catalog import MediaCatalog
+from lib.names import normalize_user_name, UserNameError
 
 # pygame 2.5.x imports pkg_resources during startup, which emits a deprecation
 # warning under modern setuptools. Narrowly suppress that third-party warning
@@ -554,6 +555,10 @@ class Karaoke:
 
 	@synchronized_state
 	def enqueue(self, song_path, user="Pikaraoke"):
+		try:
+			user = normalize_user_name(user)
+		except UserNameError:
+			return False
 		catalog = getattr(self, 'available_song_set', self.available_songs)
 		if not isinstance(song_path, str) or song_path not in catalog:
 			logging.warning("Ignoring song outside the current catalog: %r", song_path)
@@ -561,14 +566,15 @@ class Karaoke:
 		if self.is_song_in_queue(song_path):
 			logging.info("Song is already in queue: %s", song_path)
 			return False
-		self.queue.append({"user": str(user), "file": song_path, "title": self.filename_from_path(song_path)})
+		self.queue.append({"user": user, "file": song_path, "title": self.filename_from_path(song_path)})
 		self.update_queue()
 		return True
 
 
 	@synchronized_state
-	def queue_add_random(self, amount):
+	def queue_add_random(self, amount, user="Random"):
 		try:
+			user = normalize_user_name(user)
 			amount = int(amount)
 		except (TypeError, ValueError):
 			return False
@@ -578,7 +584,7 @@ class Karaoke:
 		candidates = [song for song in self.available_songs if song not in queued]
 		selected = random.sample(candidates, min(amount, len(candidates)))
 		for song in selected:
-			self.queue.append({"user": "Random", "file": song, "title": self.filename_from_path(song)})
+			self.queue.append({"user": user, "file": song, "title": self.filename_from_path(song)})
 		if selected:
 			self.update_queue()
 		return len(selected) == amount

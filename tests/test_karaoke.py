@@ -151,6 +151,12 @@ class KaraokeTests(unittest.TestCase):
         self.assertFalse(self.k.switchingSong)
         self.assertIsNone(self.k.pending_audio_track_index)
 
+    def test_first_song_starts_at_requested_initial_volume_250(self):
+        self.k.volume = 250
+        self.start()
+        self.assertEqual(self.k.vlcclient.starts[0][1], 250)
+        self.assertEqual(self.k.volume, 250)
+
     def test_postlaunch_audio_metadata_applies_preferred_track_not_just_label(self):
         self.k.vlcclient.current_track = 1
         def tracks(xml=None, file_path=None):

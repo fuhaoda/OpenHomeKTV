@@ -19,12 +19,8 @@
 
     $('a.add-song-link').on('click', function(event) {
   event.preventDefault();
-  var user = Cookies.get('user');
-  if (!user) {
-    user = window.prompt({{getString1(92)|tojson}});
-    if (!user) return;
-    Cookies.set('user', user, {expires: 3650});
-  }
+  var user = KTV.ensureUserName();
+  if (!user) return;
   $.get('/enqueue', {song: this.dataset.file, user: user}).done(function(data) {
     var result = KTV.parseData(data);
     if (!result) return;

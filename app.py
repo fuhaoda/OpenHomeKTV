@@ -17,6 +17,7 @@ from collections import defaultdict
 from lib.get_platform import *
 from lib.vlcclient import get_default_vlc_path, PlaybackError
 from lib.media import media_title
+from lib.names import normalize_user_name, UserNameError
 from lib.events import (
 	broadcast, flash, ip2websock, register_client, send_client, unregister_client,
 )
@@ -42,6 +43,11 @@ def playback_error(error):
 	logging.warning('Playback request failed: %s', error)
 	flash(str(error), 'is-warning')
 	return jsonify(success=False, error=str(error)), 503
+
+
+@app.errorhandler(UserNameError)
+def invalid_user_name(error):
+	return jsonify(success=False, error=str(error)), 400
 
 
 def get_system_locale_name():
@@ -259,9 +265,12 @@ def change_language(language):
 def user_rename(old_name=None, new_name=None):
 	if request.method == 'POST':
 		data = request.get_json(silent=True) if request.is_json else request.form
-		old_name, new_name = (data or {}).get('old_name'), (data or {}).get('new_name')
-	if not isinstance(old_name, str) or not isinstance(new_name, str) or not new_name.strip():
-		return 'Both user names are required', 400
+		if not hasattr(data, 'get'):
+			raise UserNameError('Both user names are required.')
+		old_name, new_name = data.get('old_name'), data.get('new_name')
+	if not isinstance(old_name, str):
+		raise UserNameError('The previous user name is required.')
+	new_name = normalize_user_name(new_name)
 	with K.state_lock:
 		for q in K.queue:
 			if q['user'] == old_name:
@@ -302,7 +311,8 @@ def add_random():
 	amount = request.args.get('amount', type=int)
 	if amount is None or amount < 1 or amount > 100:
 		return 'Amount must be between 1 and 100', 400
-	rc = K.queue_add_random(amount)
+	user = normalize_user_name(request.args.get('user'))
+	rc = K.queue_add_random(amount, user=user)
 	if rc:
 		flash(getString(4) % amount, "is-success")
 	else:
@@ -372,9 +382,10 @@ def queue_edit():
 def enqueue():
 	d = request.values.to_dict()
 	song = d.get('song', d.get('song-to-add'))
-	user = d.get('user', d.get('song-added-by', 'Singer'))
+	user = d.get('user', d.get('song-added-by'))
 	if not song:
 		return 'Song is required', 400
+	user = normalize_user_name(user)
 	rc = K.enqueue(song, user)
 	song_title = filename_from_path(song)
 	return json.dumps({"song": song_title, "success": rc})
@@ -658,7 +669,7 @@ def load_media_paths(base_dir):
 if __name__ == "__main__":
 	platform = get_platform()
 	default_port = 5232
-	default_volume = 0
+	default_volume = 250
 	default_splash_delay = 3
 	default_log_level = logging.INFO
 	default_lang = get_system_locale_name()

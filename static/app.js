@@ -28,6 +28,91 @@
     }
   }
 
+  function normalizeUserName(value) {
+    if (typeof value !== 'string') return '';
+    // Match Python str.strip() before NFC normalization, including Unicode spaces.
+    return value.replace(/^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, '').normalize('NFC');
+  }
+
+  function isValidUserName(value) {
+    var name = normalizeUserName(value);
+    var length = Array.from(name).length;
+    return length >= 1 && length <= 10 && !/[\u0000-\u001f\u007f-\u009f]/.test(name);
+  }
+
+  function userNameMessages() {
+    var language = (root.Cookies && root.Cookies.get('lang')) || (root.navigator && root.navigator.language) || 'en';
+    return /^zh(?:[-_]|$)/i.test(language) ? {
+      prompt: '请输入姓名（1–10 个字符），姓名会显示在你点的歌曲旁边。',
+      invalid: '姓名必须为 1–10 个字符，不能包含换行或控制字符。请重新输入。',
+      unset: '请输入姓名'
+    } : {
+      prompt: 'Please enter your name (1–10 characters). It will appear beside your songs.',
+      invalid: 'Use 1–10 characters, without line breaks or control characters. Please try again.',
+      unset: 'Set name'
+    };
+  }
+
+  function displayUserName(name) {
+    root.currentUser = name || null;
+    var link = root.document && root.document.querySelector && root.document.querySelector('#current-user');
+    if (link) {
+      link.classList.remove('is-hidden');
+      var label = link.querySelector('span');
+      if (label) label.textContent = name || userNameMessages().unset;
+    }
+  }
+
+  function getSavedUserName() {
+    if (!root.Cookies) return null;
+    var raw = root.Cookies.get('user');
+    var name = normalizeUserName(raw);
+    // Older versions silently assigned user-N; require one explicit confirmation.
+    var generated = /^user-\d+$/i.test(name) && root.Cookies.get('user_confirmed') !== '1';
+    if (!isValidUserName(name) || generated) {
+      root.Cookies.remove('user');
+      root.Cookies.remove('user_confirmed');
+      return null;
+    }
+    return name;
+  }
+
+  function rememberUserName(value) {
+    var name = normalizeUserName(value);
+    if (!isValidUserName(name)) return null;
+    if (root.Cookies) {
+      root.Cookies.set('user', name, {expires: 3650});
+      root.Cookies.set('user_confirmed', '1', {expires: 3650});
+    }
+    displayUserName(name);
+    return name;
+  }
+
+  function promptUserName(initialName) {
+    var messages = userNameMessages();
+    var message = messages.prompt;
+    var candidate = normalizeUserName(initialName);
+    while (true) {
+      var answer = root.prompt(message, candidate);
+      if (answer === null) return null;
+      candidate = normalizeUserName(answer);
+      if (isValidUserName(candidate)) return candidate;
+      message = messages.invalid + '\n\n' + messages.prompt;
+    }
+  }
+
+  function initializeUserName() {
+    var name = getSavedUserName();
+    displayUserName(name);
+    return name;
+  }
+
+  function ensureUserName() {
+    var name = getSavedUserName();
+    if (!name) name = promptUserName('');
+    return name === null ? null : rememberUserName(name);
+  }
+
   function formatTime(value) {
     var seconds = Number(value);
     seconds = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
@@ -66,7 +151,7 @@
     if (!songs.length) {
       var empty = root.document.createElement('tr');
       var cell = textElement('td', labels.empty || '', 'has-text-warning');
-      cell.colSpan = 5;
+      cell.colSpan = 4;
       empty.appendChild(cell);
       body.appendChild(empty);
     }
@@ -93,10 +178,11 @@
       move.appendChild(actions);
       row.appendChild(move);
       var songCell = textElement('td', null, 'queue-song');
+      if (song.user) {
+        songCell.appendChild(textElement('span', String(song.user) + ': ', 'queue-singer has-text-success'));
+      }
       songCell.appendChild(textElement('span', song.title, 'queue-title'));
-      songCell.appendChild(textElement('span', song.user, 'queue-singer-mobile has-text-success'));
       row.appendChild(songCell);
-      row.appendChild(textElement('td', song.user, 'queue-user has-text-success'));
       var remove = textElement('td', null, 'queue-delete-cell');
       var deleteButton = button('delete', 'icon-trash-empty', labels.remove);
       deleteButton.classList.remove('has-text-success');
@@ -175,6 +261,9 @@
 
   return {
     parseData: parseData, dispatchMessage: dispatchMessage, formatTime: formatTime, showRequestError: showRequestError,
+    normalizeUserName: normalizeUserName, isValidUserName: isValidUserName, getSavedUserName: getSavedUserName,
+    rememberUserName: rememberUserName, promptUserName: promptUserName, initializeUserName: initializeUserName,
+    ensureUserName: ensureUserName,
     renderSong: renderSong, renderQueue: renderQueue, startQueue: startQueue
   };
 }));
